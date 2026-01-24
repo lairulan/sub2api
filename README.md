@@ -16,6 +16,28 @@ English | [中文](README_CN.md)
 
 ---
 
+## 📢 Contact
+
+WeChat: **faheng2009**
+
+---
+
+## 🆕 What's New (v0.1.61)
+
+### Features
+- Increased account auto-switch attempts (Claude: 10→15, Gemini: 3→5) for better reliability
+- Extended auto-retry error coverage (added 408, 502, 503, 504 auto-failover)
+
+### Bug Fixes
+- Enhanced signature error detection for AWS Bedrock ValidationException
+- Fixed thinking mode requests failing due to missing signature
+
+### Improvements
+- Optimized error messages for end users (e.g., "Service is busy, please retry later")
+- Reduced technical error exposure to end users
+
+---
+
 ## Demo
 
 Try Sub2API online: **https://v2.pincc.ai/**
