@@ -46,8 +46,8 @@ func NewGatewayHandler(
 	cfg *config.Config,
 ) *GatewayHandler {
 	pingInterval := time.Duration(0)
-	maxAccountSwitches := 10
-	maxAccountSwitchesGemini := 3
+	maxAccountSwitches := 15
+	maxAccountSwitchesGemini := 5
 	if cfg != nil {
 		pingInterval = time.Duration(cfg.Concurrency.PingInterval) * time.Second
 		if cfg.Gateway.MaxAccountSwitches > 0 {

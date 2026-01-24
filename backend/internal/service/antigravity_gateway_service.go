@@ -979,14 +979,21 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 }
 
 func isSignatureRelatedError(respBody []byte) bool {
-	msg := strings.ToLower(strings.TrimSpace(extractAntigravityErrorMessage(respBody)))
-	if msg == "" {
-		// Fallback: best-effort scan of the raw payload.
-		msg = strings.ToLower(string(respBody))
-	}
+	// 直接搜索整个响应体，更可靠
+	msg := strings.ToLower(string(respBody))
 
 	// Keep this intentionally broad: different upstreams may use "signature" or "thought_signature".
 	if strings.Contains(msg, "thought_signature") || strings.Contains(msg, "signature") {
+		return true
+	}
+
+	// 检测 AWS Bedrock 的 ValidationException + Field required 组合
+	if strings.Contains(msg, "validationexception") && strings.Contains(msg, "field required") {
+		return true
+	}
+
+	// 检测 thinking/thought 相关的验证错误
+	if strings.Contains(msg, "field required") && (strings.Contains(msg, "thought") || strings.Contains(msg, "thinking")) {
 		return true
 	}
 
@@ -1497,7 +1504,7 @@ handleSuccess:
 
 func (s *AntigravityGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
-	case 401, 403, 429, 529:
+	case 401, 403, 408, 429, 502, 503, 504, 529:
 		return true
 	default:
 		return statusCode >= 500
@@ -2149,27 +2156,27 @@ func (s *AntigravityGatewayService) writeMappedClaudeError(c *gin.Context, accou
 	case 400:
 		statusCode = http.StatusBadRequest
 		errType = "invalid_request_error"
-		errMsg = "Invalid request"
+		errMsg = "Request format error, please check and retry"
 	case 401:
 		statusCode = http.StatusBadGateway
 		errType = "authentication_error"
-		errMsg = "Upstream authentication failed"
+		errMsg = "Service authentication failed, please retry later"
 	case 403:
 		statusCode = http.StatusBadGateway
 		errType = "permission_error"
-		errMsg = "Upstream access forbidden"
+		errMsg = "Service access denied, please retry later"
 	case 429:
 		statusCode = http.StatusTooManyRequests
 		errType = "rate_limit_error"
-		errMsg = "Upstream rate limit exceeded"
+		errMsg = "Service is busy, please retry later"
 	case 529:
 		statusCode = http.StatusServiceUnavailable
 		errType = "overloaded_error"
-		errMsg = "Upstream service overloaded"
+		errMsg = "Service is overloaded, please retry later"
 	default:
 		statusCode = http.StatusBadGateway
 		errType = "upstream_error"
-		errMsg = "Upstream request failed"
+		errMsg = "Service temporarily unavailable, please retry later"
 	}
 
 	c.JSON(statusCode, gin.H{
