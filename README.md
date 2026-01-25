@@ -38,16 +38,6 @@ WeChat: **faheng2009**
 
 ---
 
-## Demo
-
-Try Sub2API online: **https://v2.pincc.ai/**
-
-Demo credentials (shared demo environment; **not** created automatically for self-hosted installs):
-
-| Email | Password |
-|-------|----------|
-| admin@sub2api.com | admin123 |
-
 ## Overview
 
 Sub2API is an AI API gateway platform designed to distribute and manage API quotas from AI product subscriptions (like Claude Code $200/month). Users can access upstream AI services through platform-generated API Keys, while the platform handles authentication, billing, load balancing, and request forwarding.
