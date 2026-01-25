@@ -1939,6 +1939,10 @@ const (
 	// 最大重试耗时（包含请求本身耗时 + 退避等待时间）。
 	// 用于防止极端情况下 goroutine 长时间堆积导致资源耗尽。
 	maxRetryElapsed = 10 * time.Second
+
+	// Signature 重试专用时间预算（独立于 maxRetryElapsed）
+	// 避免首次请求耗时过长导致 signature 重试被跳过
+	maxSignatureRetryElapsed = 20 * time.Second
 )
 
 func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode int) bool {
@@ -1952,7 +1956,12 @@ func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode i
 }
 
 // shouldFailoverUpstreamError determines whether an upstream error should trigger account failover.
-func (s *GatewayService) shouldFailoverUpstreamError(statusCode int) bool {
+func (s *GatewayService) shouldFailoverUpstreamError(statusCode int, respBody []byte) bool {
+	// 特殊处理：400 + signature 错误也应该切换账号
+	if statusCode == http.StatusBadRequest && s.isThinkingBlockSignatureError(respBody) {
+		return true
+	}
+
 	switch statusCode {
 	case 401, 403, 429, 529:
 		return true
@@ -2377,12 +2386,18 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 							strings.Contains(m, "function_response")
 					}
 
+					// 为 signature 重试单独计时（不受首次请求耗时影响）
+					signatureRetryStart := time.Now()
+
 					// 避免在重试预算已耗尽时再发起额外请求
 					if time.Since(retryStart) >= maxRetryElapsed {
+						log.Printf("Account %d: signature retry skipped due to overall timeout (elapsed=%v, budget=%v)",
+							account.ID, time.Since(retryStart), maxRetryElapsed)
 						resp.Body = io.NopCloser(bytes.NewReader(respBody))
 						break
 					}
-					log.Printf("Account %d: detected thinking block signature error, retrying with filtered thinking blocks", account.ID)
+					log.Printf("Account %d: detected thinking block signature error, retrying with filtered thinking blocks (budget=%v)",
+						account.ID, maxSignatureRetryElapsed)
 
 					// Conservative two-stage fallback:
 					// 1) Disable thinking + thinking->text (preserve content)
@@ -2419,8 +2434,9 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 									}(),
 								})
 								msg2 := extractUpstreamErrorMessage(retryRespBody)
-								if looksLikeToolSignatureError(msg2) && time.Since(retryStart) < maxRetryElapsed {
-									log.Printf("Account %d: signature retry still failing and looks tool-related, retrying with tool blocks downgraded", account.ID)
+								if looksLikeToolSignatureError(msg2) && time.Since(signatureRetryStart) < maxSignatureRetryElapsed {
+									log.Printf("Account %d: signature retry still failing and looks tool-related, retrying with tool blocks downgraded (elapsed=%v)",
+										account.ID, time.Since(signatureRetryStart))
 									filteredBody2 := FilterSignatureSensitiveBlocksForRetry(body)
 									retryReq2, buildErr2 := s.buildUpstreamRequest(ctx, c, account, filteredBody2, token, tokenType, reqModel)
 									if buildErr2 == nil {
@@ -2458,7 +2474,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 						if retryResp != nil && retryResp.Body != nil {
 							_ = retryResp.Body.Close()
 						}
-						log.Printf("Account %d: signature error retry failed: %v", account.ID, retryErr)
+						log.Printf("Account %d: signature error retry failed: %v (elapsed=%v)", account.ID, retryErr, time.Since(signatureRetryStart))
 					} else {
 						log.Printf("Account %d: signature error retry build request failed: %v", account.ID, buildErr)
 					}
@@ -2534,11 +2550,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// 处理重试耗尽的情况
 	if resp.StatusCode >= 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {
-		if s.shouldFailoverUpstreamError(resp.StatusCode) {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-			_ = resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
+		if s.shouldFailoverUpstreamError(resp.StatusCode, respBody) {
 			// 调试日志：打印重试耗尽后的错误响应
 			log.Printf("[Forward] Upstream error (retry exhausted, failover): Account=%d(%s) Status=%d RequestID=%s Body=%s",
 				account.ID, account.Name, resp.StatusCode, resp.Header.Get("x-request-id"), truncateString(string(respBody), 1000))
@@ -2565,31 +2581,33 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	// 处理可切换账号的错误
-	if resp.StatusCode >= 400 && s.shouldFailoverUpstreamError(resp.StatusCode) {
+	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
-		// 调试日志：打印上游错误响应
-		log.Printf("[Forward] Upstream error (failover): Account=%d(%s) Status=%d RequestID=%s Body=%s",
-			account.ID, account.Name, resp.StatusCode, resp.Header.Get("x-request-id"), truncateString(string(respBody), 1000))
+		if s.shouldFailoverUpstreamError(resp.StatusCode, respBody) {
+			// 调试日志：打印上游错误响应
+			log.Printf("[Forward] Upstream error (failover): Account=%d(%s) Status=%d RequestID=%s Body=%s",
+				account.ID, account.Name, resp.StatusCode, resp.Header.Get("x-request-id"), truncateString(string(respBody), 1000))
 
-		s.handleFailoverSideEffects(ctx, resp, account)
-		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-			Platform:           account.Platform,
-			AccountID:          account.ID,
-			UpstreamStatusCode: resp.StatusCode,
-			UpstreamRequestID:  resp.Header.Get("x-request-id"),
-			Kind:               "failover",
-			Message:            extractUpstreamErrorMessage(respBody),
-			Detail: func() string {
-				if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
-					return truncateString(string(respBody), s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes)
-				}
-				return ""
-			}(),
-		})
-		return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode}
+			s.handleFailoverSideEffects(ctx, resp, account)
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				UpstreamStatusCode: resp.StatusCode,
+				UpstreamRequestID:  resp.Header.Get("x-request-id"),
+				Kind:               "failover",
+				Message:            extractUpstreamErrorMessage(respBody),
+				Detail: func() string {
+					if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
+						return truncateString(string(respBody), s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes)
+					}
+					return ""
+				}(),
+			})
+			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode}
+		}
 	}
 
 	// 处理错误响应（不可重试的错误）
