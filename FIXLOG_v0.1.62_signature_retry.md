@@ -232,7 +232,7 @@ sudo journalctl -u sub2api --since today | grep "failover" | wc -l
 
 如有问题或需要支持：
 - **微信：** faheng2009
-- **项目地址：** https://github.com/Wei-Shaw/sub2api
+- **项目地址：** https://github.com/lairulan/sub2api
 
 ---
 

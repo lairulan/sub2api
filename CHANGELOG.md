@@ -92,12 +92,12 @@ sudo journalctl -u sub2api -f | grep "failover"
 
 ## Version History
 
-For detailed version history and previous releases, see [GitHub Releases](https://github.com/Wei-Shaw/sub2api/releases).
+For detailed version history and previous releases, see [GitHub Releases](https://github.com/lairulan/sub2api/releases).
 
 ---
 
 ## Support
 
 - **WeChat**: faheng2009
-- **GitHub Issues**: https://github.com/Wei-Shaw/sub2api/issues
+- **GitHub Issues**: https://github.com/lairulan/sub2api/issues
 - **Documentation**: See README.md
