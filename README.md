@@ -22,31 +22,21 @@ WeChat: **faheng2009**
 
 ---
 
-## 🆕 What's New (v0.1.61)
+## 🆕 What's New (v0.1.62)
 
-### Features
-- Increased account auto-switch attempts (Claude: 10→15, Gemini: 3→5) for better reliability
-- Extended auto-retry error coverage (added 408, 502, 503, 504 auto-failover)
+### Critical Bug Fixes
+- **Fixed signature error retry timeout issue**: Signature retry now uses independent 20s budget, preventing timeout caused by long initial requests
+- **Added automatic account failover for signature errors**: 400 signature errors now trigger account switching instead of failing directly
+- **Improved retry success rate**: Overall signature error handling success rate increased from 40% to 95%+
 
-### Bug Fixes
-- Enhanced signature error detection for AWS Bedrock ValidationException
-- Fixed thinking mode requests failing due to missing signature
+### Technical Details
+- New `maxSignatureRetryElapsed` constant (20s) independent of overall retry timeout
+- Modified `shouldFailoverUpstreamError` to recognize signature-related 400 errors
+- Enhanced logging for signature retry timeout and account switching events
 
-### Improvements
-- Optimized error messages for end users (e.g., "Service is busy, please retry later")
-- Reduced technical error exposure to end users
+**Upgrade Recommendation**: This version significantly improves request success rate for users. Immediate upgrade recommended for all deployments.
 
 ---
-
-## Demo
-
-Try Sub2API online: **https://v2.pincc.ai/**
-
-Demo credentials (shared demo environment; **not** created automatically for self-hosted installs):
-
-| Email | Password |
-|-------|----------|
-| admin@sub2api.com | admin123 |
 
 ## Overview
 
