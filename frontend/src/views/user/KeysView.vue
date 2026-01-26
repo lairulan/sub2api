@@ -946,7 +946,7 @@ const executeCcsImport = (row: ApiKey, clientType: 'claude' | 'gemini') => {
   const params = new URLSearchParams({
     resource: 'provider',
     app: app,
-    name: 'sub2api',
+    name: '0xfaheng',
     homepage: baseUrl,
     endpoint: endpoint,
     apiKey: row.key,
