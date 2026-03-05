@@ -533,7 +533,7 @@ function generateOpenAIWsFiles(baseUrl: string, apiKey: string): FileConfig[] {
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
 
   // config.toml content with WebSocket v2
-  const configContent = `model_provider = "sub2api"
+  const configContent = `model_provider = "0xfaheng"
 model = "gpt-5.3-codex"
 model_reasoning_effort = "high"
 network_access = "enabled"
@@ -541,8 +541,8 @@ disable_response_storage = true
 windows_wsl_setup_acknowledged = true
 model_verbosity = "high"
 
-[model_providers.sub2api]
-name = "sub2api"
+[model_providers.0xfaheng]
+name = "0xfaheng"
 base_url = "${baseUrl}"
 wire_api = "responses"
 supports_websockets = true
