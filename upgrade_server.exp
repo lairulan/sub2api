@@ -1,0 +1,36 @@
+#!/usr/bin/expect -f
+
+set password "rulan383X"
+set timeout 60
+
+spawn ssh -o StrictHostKeyChecking=no root@119.45.35.97
+
+expect {
+    "password:" {
+        send "$password\r"
+        exp_continue
+    }
+    "# " {
+        send "cd /opt/sub2api\r"
+    }
+}
+
+expect "# "
+send "git pull\r"
+
+expect "# "
+send "docker-compose -f docker-compose.local.yml pull\r"
+
+expect {
+    "Pulling" {
+        exp_continue
+    }
+    "# " {
+        send "docker-compose -f docker-compose.local.yml up -d\r"
+    }
+}
+
+expect "# "
+send "docker-compose -f docker-compose.local.yml logs --tail=20 sub2api\r"
+
+expect eof

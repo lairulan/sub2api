@@ -123,7 +123,7 @@
                 </router-link>
 
                 <a
-                  href="https://github.com/lairulan/sub2api"
+                  href="https://github.com/lairulan/0xfaheng"
                   target="_blank"
                   rel="noopener noreferrer"
                   @click="closeDropdown"
