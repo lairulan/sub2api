@@ -2,6 +2,11 @@ name: Export Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to export (e.g., 0.1.104)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -20,12 +25,13 @@ jobs:
 
       - name: Pull and export image
         run: |
-          docker pull ghcr.io/lairulan/sub2api:0.1.103
-          docker save ghcr.io/lairulan/sub2api:0.1.103 | gzip > sub2api-0.1.103.tar.gz
-          ls -lh sub2api-0.1.103.tar.gz
+          VERSION=${{ github.event.inputs.version }}
+          docker pull ghcr.io/lairulan/sub2api:${VERSION}
+          docker save ghcr.io/lairulan/sub2api:${VERSION} | gzip > sub2api-${VERSION}.tar.gz
+          ls -lh sub2api-${VERSION}.tar.gz
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.103
-          files: sub2api-0.1.103.tar.gz
+          tag_name: v${{ github.event.inputs.version }}
+          files: sub2api-${{ github.event.inputs.version }}.tar.gz
