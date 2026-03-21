@@ -12,12 +12,17 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
+import paramiko
+
 # ─── Configuration (from environment / secrets) ─────────────
 API_BASE = "https://relay.0xfaheng.xyz/api/v1"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+SSH_HOST = "119.45.35.97"
+SSH_USER = "ubuntu"
+SSH_PASSWORD = os.environ.get("SSH_PASSWORD", "")
 TZ = "Asia/Shanghai"
 
 
@@ -78,6 +83,161 @@ def fmt_n(n):
 
 def fmt_c(c):
     return f"${c:.2f}"
+
+
+# ─── SSH Server Health ───────────────────────────────────────
+def ssh_exec(ssh, cmd):
+    """通过 SSH 执行命令并返回 stdout"""
+    try:
+        _, stdout, _ = ssh.exec_command(cmd, timeout=15)
+        return stdout.read().decode().strip()
+    except Exception:
+        return ""
+
+
+def get_server_health():
+    """通过 SSH 采集服务器健康数据"""
+    if not SSH_PASSWORD:
+        print("  SSH_PASSWORD not set, skipping health check")
+        return None
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(SSH_HOST, username=SSH_USER, password=SSH_PASSWORD, timeout=15)
+        print("  SSH connected")
+    except Exception as e:
+        print(f"  SSH connect failed: {e}")
+        return None
+
+    h = {}
+    try:
+        # CPU 使用率
+        cpu_raw = ssh_exec(ssh, "top -bn1 | grep 'Cpu(s)' | awk '{print $2}'")
+        h["cpu"] = float(cpu_raw.replace(",", ".")) if cpu_raw else 0
+
+        # 内存
+        mem = ssh_exec(ssh, "free -m | awk 'NR==2{printf \"%s|%s|%.1f\", $2,$3,$3/$2*100}'")
+        p = mem.split("|")
+        h["mem_total"] = int(p[0])
+        h["mem_used"] = int(p[1])
+        h["mem_pct"] = float(p[2])
+
+        # 磁盘
+        disk = ssh_exec(ssh, "df -h / | awk 'NR==2{printf \"%s|%s|%s\", $2,$3,$5}'")
+        p = disk.split("|")
+        h["disk_total"] = p[0]
+        h["disk_used"] = p[1]
+        h["disk_pct"] = int(p[2].replace("%", ""))
+
+        # 负载
+        load = ssh_exec(ssh, "cat /proc/loadavg | awk '{print $1}'")
+        h["load"] = float(load) if load else 0
+
+        # 系统运行时长
+        h["uptime"] = ssh_exec(ssh, "uptime -p") or "未知"
+
+        # Docker 容器状态
+        docker_raw = ssh_exec(ssh,
+            "sudo docker ps --format '{{.Names}}|{{.Status}}' 2>/dev/null || "
+            "docker ps --format '{{.Names}}|{{.Status}}'")
+        containers = []
+        for line in docker_raw.split("\n"):
+            if "|" in line:
+                n, s = line.split("|", 1)
+                containers.append({"name": n, "status": s})
+        h["containers"] = containers
+
+        print("  Health data collected")
+    except Exception as e:
+        print(f"  Health collection error: {e}")
+
+    ssh.close()
+    return h
+
+
+def get_error_analysis(yesterday):
+    """通过 SSH 查询数据库中的错误日志"""
+    if not SSH_PASSWORD:
+        return None
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(SSH_HOST, username=SSH_USER, password=SSH_PASSWORD, timeout=15)
+    except Exception as e:
+        print(f"  SSH for error analysis failed: {e}")
+        return None
+
+    errors = {}
+    try:
+        # 查询当天失败的请求 (status != 'success' 或 error 不为空)
+        sql_error_count = (
+            f"SELECT COUNT(*) FROM usage_logs "
+            f"WHERE created_at::date = '{yesterday}' "
+            f"AND (status != 'success' OR error_message IS NOT NULL AND error_message != '')"
+        )
+        err_count_raw = ssh_exec(ssh,
+            f'docker exec sub2api-postgres psql -U sub2api -d sub2api -t -A -c "{sql_error_count}"')
+        errors["total_errors"] = int(err_count_raw) if err_count_raw.isdigit() else 0
+
+        # 按错误类型分组
+        sql_error_types = (
+            f"SELECT COALESCE(status, 'unknown'), COUNT(*) FROM usage_logs "
+            f"WHERE created_at::date = '{yesterday}' "
+            f"AND (status != 'success' OR error_message IS NOT NULL AND error_message != '') "
+            f"GROUP BY status ORDER BY COUNT(*) DESC LIMIT 10"
+        )
+        types_raw = ssh_exec(ssh,
+            f'docker exec sub2api-postgres psql -U sub2api -d sub2api -t -A -c "{sql_error_types}"')
+        error_types = []
+        for line in types_raw.split("\n"):
+            if "|" in line:
+                parts = line.split("|")
+                error_types.append({"type": parts[0], "count": int(parts[1])})
+        errors["by_type"] = error_types
+
+        # 最近的错误消息 (去重，取最近5条)
+        sql_recent = (
+            f"SELECT DISTINCT ON (error_message) error_message, model, created_at "
+            f"FROM usage_logs "
+            f"WHERE created_at::date = '{yesterday}' "
+            f"AND error_message IS NOT NULL AND error_message != '' "
+            f"ORDER BY error_message, created_at DESC LIMIT 5"
+        )
+        recent_raw = ssh_exec(ssh,
+            f'docker exec sub2api-postgres psql -U sub2api -d sub2api -t -A -c "{sql_recent}"')
+        recent_errors = []
+        for line in recent_raw.split("\n"):
+            if "|" in line:
+                parts = line.split("|")
+                recent_errors.append({
+                    "message": parts[0][:60],
+                    "model": parts[1] if len(parts) > 1 else "?",
+                    "time": parts[2][-8:] if len(parts) > 2 else ""
+                })
+        errors["recent"] = recent_errors
+
+        # 成功率
+        sql_total = (
+            f"SELECT COUNT(*) FROM usage_logs "
+            f"WHERE created_at::date = '{yesterday}'"
+        )
+        total_raw = ssh_exec(ssh,
+            f'docker exec sub2api-postgres psql -U sub2api -d sub2api -t -A -c "{sql_total}"')
+        total_db = int(total_raw) if total_raw.isdigit() else 0
+        errors["total_requests"] = total_db
+        if total_db > 0:
+            errors["success_rate"] = ((total_db - errors["total_errors"]) / total_db) * 100
+        else:
+            errors["success_rate"] = 100
+
+        print(f"  Error analysis done: {errors['total_errors']} errors found")
+    except Exception as e:
+        print(f"  Error analysis failed: {e}")
+
+    ssh.close()
+    return errors
 
 
 # ─── Main ────────────────────────────────────────────────────
@@ -162,6 +322,10 @@ def main():
 
     print("  Data fetched")
 
+    # ─── Server Health + Error Analysis (via SSH) ──────────
+    health = get_server_health()
+    error_data = get_error_analysis(yesterday)
+
     # ─── Parse ───────────────────────────────────────────────
     total_req = stats.get("total_requests", 0)
     total_tokens = stats.get("total_tokens", 0)
@@ -243,6 +407,27 @@ def main():
             f"最高费用: {peak_cost_h} ({fmt_c(peak_cost_v)})",
         ]
 
+    # 服务器健康度
+    if health:
+        lines1 += [
+            "",
+            "━━ <b>服务器健康</b> ━━━━━━━━",
+            f"CPU:  <code>{bar(health.get('cpu', 0))}</code> {health.get('cpu', 0):.1f}%",
+            f"内存: <code>{bar(health.get('mem_pct', 0))}</code> "
+                f"{health.get('mem_used', 0)}M/{health.get('mem_total', 0)}M",
+            f"磁盘: <code>{bar(health.get('disk_pct', 0))}</code> "
+                f"{health.get('disk_used', '?')}/{health.get('disk_total', '?')}",
+            f"负载: {health.get('load', 0):.2f} | {health.get('uptime', '未知')}",
+        ]
+        if health.get("containers"):
+            lines1.append("")
+            lines1.append("<b>Docker容器:</b>")
+            for c in health["containers"]:
+                st = c["status"]
+                is_ok = "up" in st.lower()
+                dot = "+" if is_ok else "!"
+                lines1.append(f"  [{dot}] {c['name']}: {st[:35]}")
+
     # 消息2: 模型 + Key + 分组
     lines2 = [f"<b>模型使用分布</b> ({yesterday})", ""]
     for m in sorted(model_list, key=lambda x: x.get("cost", 0), reverse=True):
@@ -305,6 +490,35 @@ def main():
         lines3.append(
             f"  <code>{dd} {b}</code> {dreq:>4}次 {fmt_c(dcost):>7}{mark}"
         )
+
+    # 错误分析
+    if error_data and error_data.get("total_errors", 0) > 0:
+        lines3 += [
+            "",
+            "━━ <b>错误分析</b> ━━━━━━━━━",
+            f"成功率: <b>{error_data.get('success_rate', 100):.1f}%</b>",
+            f"错误数: <b>{error_data['total_errors']}</b> / "
+                f"{error_data.get('total_requests', 0)}总请求",
+        ]
+        if error_data.get("by_type"):
+            lines3.append("")
+            lines3.append("<b>错误类型:</b>")
+            for et in error_data["by_type"]:
+                lines3.append(f"  {et['type']}: {et['count']}次")
+        if error_data.get("recent"):
+            lines3.append("")
+            lines3.append("<b>最近错误:</b>")
+            for re in error_data["recent"]:
+                lines3.append(
+                    f"  <code>{re.get('time', '')}</code> "
+                    f"{re.get('model', '?')[:15]}: {re.get('message', '')[:40]}"
+                )
+    elif error_data:
+        lines3 += [
+            "",
+            "━━ <b>错误分析</b> ━━━━━━━━━",
+            f"成功率: <b>100%</b> (无错误)",
+        ]
 
     lines3 += [
         "",
