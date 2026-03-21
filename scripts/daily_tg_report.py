@@ -359,185 +359,128 @@ def main():
     w_cost = sum(d.get("cost", 0) for d in weekly)
     w_req = sum(d.get("requests", 0) for d in weekly)
 
-    # ─── Build Messages ─────────────────────────────────────
-    def bar(pct, w=10):
+    # ─── Build Single Message ────────────────────────────────
+    def bar(pct, w=8):
         filled = int(pct / 100 * w)
         return "\u2588" * filled + "\u2591" * (w - filled)
 
-    # 消息1: 总览 + 上游账号 + 高峰时段
-    lines1 = [
-        f"<b>neo-法恒 每日运营报告</b>",
-        f"<code>{yesterday}</code> | relay.0xfaheng.xyz",
+    L = [
+        f"<b>neo-法恒 每日报告</b> <code>{yesterday}</code>",
         "",
-        "━━ <b>总览</b> ━━━━━━━━━━━━",
-        f"请求数:    <b>{total_req}</b>",
-        f"Token消耗: <b>{fmt_n(total_tokens)}</b>",
-        f"费用:      <b>{fmt_c(total_cost)}</b>",
-        f"平均响应:  <b>{avg_dur:.1f}秒</b>",
-        f"活跃Key:   <b>{len(key_trend)}个</b>",
-        f"用户:      {active_users}活跃 / {total_users}总计",
-        f"运行时长:  {uptime_d}天{uptime_h % 24}小时",
-        f"累计总计:  {fmt_c(cum_cost)} / {fmt_n(cum_req)}次请求",
+        f"请求<b>{total_req}</b> | Token<b>{fmt_n(total_tokens)}</b> | "
+            f"费用<b>{fmt_c(total_cost)}</b>",
+        f"响应{avg_dur:.1f}s | Key{len(key_trend)}个 | "
+            f"用户{active_users}/{total_users}",
+        f"累计{fmt_c(cum_cost)} / {fmt_n(cum_req)}次 | "
+            f"运行{uptime_d}天{uptime_h % 24}时",
     ]
 
-    # 上游账号状态
-    acct_ok = sum(1 for a in accounts if a.get("status") == "active")
-    acct_total = len(accounts)
-    lines1 += [
-        "",
-        "━━ <b>上游账号</b> ━━━━━━━━━",
-        f"状态: {acct_ok}/{acct_total}正常" +
-            (f" ({acct_total - acct_ok}个异常!)" if acct_ok < acct_total else " (全部正常)"),
-    ]
-    for a in accounts:
-        name = a.get("name", "?")
-        status = a.get("status", "?")
-        status_cn = "正常" if status == "active" else "异常"
-        dot = "+" if status == "active" else "!"
-        err = a.get("error_message", "")
-        extra = f" - {err[:25]}" if err else ""
-        lines1.append(f"  [{dot}] {name}: {status_cn}{extra}")
-
-    # 高峰时段
-    if peak_h:
-        lines1 += [
-            "",
-            "━━ <b>高峰时段</b> ━━━━━━━━━",
-            f"最多请求: {peak_h} ({peak_req_h}次)",
-            f"最高费用: {peak_cost_h} ({fmt_c(peak_cost_v)})",
-        ]
-
-    # 服务器健康度
-    if health:
-        lines1 += [
-            "",
-            "━━ <b>服务器健康</b> ━━━━━━━━",
-            f"CPU:  <code>{bar(health.get('cpu', 0))}</code> {health.get('cpu', 0):.1f}%",
-            f"内存: <code>{bar(health.get('mem_pct', 0))}</code> "
-                f"{health.get('mem_used', 0)}M/{health.get('mem_total', 0)}M",
-            f"磁盘: <code>{bar(health.get('disk_pct', 0))}</code> "
-                f"{health.get('disk_used', '?')}/{health.get('disk_total', '?')}",
-            f"负载: {health.get('load', 0):.2f} | {health.get('uptime', '未知')}",
-        ]
-        if health.get("containers"):
-            lines1.append("")
-            lines1.append("<b>Docker容器:</b>")
-            for c in health["containers"]:
-                st = c["status"]
-                is_ok = "up" in st.lower()
-                dot = "+" if is_ok else "!"
-                lines1.append(f"  [{dot}] {c['name']}: {st[:35]}")
-
-    # 消息2: 模型 + Key + 分组
-    lines2 = [f"<b>模型使用分布</b> ({yesterday})", ""]
+    # 模型
+    L += ["", "━ <b>模型</b> ━━━━━━━━━━━━━"]
     for m in sorted(model_list, key=lambda x: x.get("cost", 0), reverse=True):
         name = m.get("model", "?")
         mreq = m.get("requests", 0)
         mcost = m.get("cost", 0)
         pct = (mcost / total_cost * 100) if total_cost > 0 else 0
-        lines2.append(
-            f"  <code>{name[:20]:20s}</code> {mreq:>3}次 {fmt_c(mcost):>7} ({pct:.0f}%)"
-        )
+        L.append(f"<code>{name[:18]:18s}</code> {mreq}次 {fmt_c(mcost)} {pct:.0f}%")
 
-    lines2 += ["", "━━ <b>API Key 用量</b> ━━━━━━━", ""]
+    # Key
+    L += ["", "━ <b>Key用量</b> ━━━━━━━━━━━"]
     for k in sorted(key_trend, key=lambda x: x.get("requests", 0), reverse=True):
         kname = k.get("key_name", k.get("name", "?"))
         kreq = k.get("requests", 0)
         ktok = k.get("tokens", 0)
         pct = (kreq / total_req * 100) if total_req > 0 else 0
-        lines2.append(
-            f"  <code>{kname[:12]:12s}</code> {kreq:>3}次 {fmt_n(ktok):>6}tok ({pct:.0f}%)"
-        )
+        L.append(f"<code>{kname[:10]:10s}</code> {kreq}次 {fmt_n(ktok)}tok {pct:.0f}%")
 
-    lines2 += ["", "━━ <b>分组统计</b> ━━━━━━━━━━", ""]
+    # 分组
+    L += ["", "━ <b>分组</b> ━━━━━━━━━━━━━"]
     for g in sorted(group_list, key=lambda x: x.get("cost", 0), reverse=True):
         gname = g.get("group_name", g.get("group", "?"))
         greq = g.get("requests", 0)
         gcost = g.get("cost", 0)
-        lines2.append(
-            f"  <code>{gname[:12]:12s}</code> {greq:>3}次 {fmt_c(gcost):>7}"
-        )
+        L.append(f"<code>{gname[:10]:10s}</code> {greq}次 {fmt_c(gcost)}")
 
-    # 消息3: 用户排名 + 7天趋势
-    lines3 = [f"<b>用户费用排名</b> ({yesterday})", ""]
-    for i, u in enumerate(user_list[:10], 1):
+    # 用户排名 (top 5)
+    L += ["", "━ <b>用户TOP5</b> ━━━━━━━━━━"]
+    for i, u in enumerate(user_list[:5], 1):
         email = u.get("email", "?")
         at_pos = email.find("@")
-        if at_pos > 3:
-            masked = email[:3] + "***" + email[at_pos:]
-        else:
-            masked = email
-        ureq = u.get("requests", 0)
-        ucost = u.get("cost", 0)
-        lines3.append(
-            f"  {i}. <code>{masked[:22]:22s}</code> {ureq:>3}次 {fmt_c(ucost):>7}"
-        )
+        masked = email[:3] + "***" + email[at_pos:] if at_pos > 3 else email
+        L.append(f"{i}. <code>{masked[:18]:18s}</code> {u['requests']}次 {fmt_c(u['cost'])}")
 
-    lines3 += [
-        "",
-        "━━ <b>近7天趋势</b> ━━━━━━━━",
-        f"合计: {fmt_c(w_cost)} / {fmt_n(w_req)}次请求",
-        ""
-    ]
+    # 7天趋势
+    L += ["", "━ <b>7天趋势</b> ━━━━━━━━━━"]
     max_req_w = max((d.get("requests", 0) for d in weekly), default=1)
     for d in weekly:
         dd = d.get("date", "")[-5:]
         dreq = d.get("requests", 0)
         dcost = d.get("cost", 0)
-        blen = int(dreq / max_req_w * 10) if max_req_w > 0 else 0
-        b = "\u2588" * blen + "\u2591" * (10 - blen)
-        mark = " <b>\u25c0</b>" if dd == yesterday[-5:] else ""
-        lines3.append(
-            f"  <code>{dd} {b}</code> {dreq:>4}次 {fmt_c(dcost):>7}{mark}"
-        )
+        blen = int(dreq / max_req_w * 8) if max_req_w > 0 else 0
+        b = "\u2588" * blen + "\u2591" * (8 - blen)
+        mark = "\u25c0" if dd == yesterday[-5:] else ""
+        L.append(f"<code>{dd} {b}</code> {dreq}次 {fmt_c(dcost)}{mark}")
+
+    # 上游账号
+    acct_ok = sum(1 for a in accounts if a.get("status") == "active")
+    acct_total = len(accounts)
+    L += ["", "━ <b>上游账号</b> ━━━━━━━━━━"]
+    for a in accounts:
+        name = a.get("name", "?")
+        dot = "+" if a.get("status") == "active" else "!"
+        st = "正常" if a.get("status") == "active" else "异常"
+        err = a.get("error_message", "")
+        extra = f" {err[:20]}" if err else ""
+        L.append(f"[{dot}] {name}: {st}{extra}")
+
+    # 高峰时段
+    if peak_h:
+        L.append(f"\n高峰: {peak_h}({peak_req_h}次) | 最贵: {peak_cost_h}({fmt_c(peak_cost_v)})")
+
+    # 服务器健康
+    if health:
+        L += ["", "━ <b>服务器</b> ━━━━━━━━━━━━"]
+        L.append(f"CPU <code>{bar(health.get('cpu', 0))}</code>{health.get('cpu', 0):.1f}% | "
+                 f"内存 <code>{bar(health.get('mem_pct', 0))}</code>{health.get('mem_pct', 0):.0f}%")
+        L.append(f"磁盘<code>{bar(health.get('disk_pct', 0))}</code>"
+                 f"{health.get('disk_used', '?')}/{health.get('disk_total', '?')} | "
+                 f"负载{health.get('load', 0):.2f}")
+        if health.get("containers"):
+            for c in health["containers"]:
+                dot = "+" if "up" in c["status"].lower() else "!"
+                L.append(f"[{dot}] {c['name']}: {c['status'][:30]}")
 
     # 错误分析
     if error_data and error_data.get("total_errors", 0) > 0:
-        lines3 += [
-            "",
-            "━━ <b>错误分析</b> ━━━━━━━━━",
-            f"成功率: <b>{error_data.get('success_rate', 100):.1f}%</b>",
-            f"错误数: <b>{error_data['total_errors']}</b> / "
-                f"{error_data.get('total_requests', 0)}总请求",
-        ]
-        if error_data.get("by_type"):
-            lines3.append("")
-            lines3.append("<b>错误类型:</b>")
-            for et in error_data["by_type"]:
-                lines3.append(f"  {et['type']}: {et['count']}次")
-        if error_data.get("recent"):
-            lines3.append("")
-            lines3.append("<b>最近错误:</b>")
-            for re in error_data["recent"]:
-                lines3.append(
-                    f"  <code>{re.get('time', '')}</code> "
-                    f"{re.get('model', '?')[:15]}: {re.get('message', '')[:40]}"
-                )
+        L += ["", "━ <b>错误</b> ━━━━━━━━━━━━━"]
+        L.append(f"成功率<b>{error_data.get('success_rate', 100):.1f}%</b> | "
+                 f"错误{error_data['total_errors']}/{error_data.get('total_requests', 0)}")
+        for et in (error_data.get("by_type") or [])[:5]:
+            L.append(f"  {et['type']}: {et['count']}次")
+        for re_item in (error_data.get("recent") or [])[:3]:
+            L.append(f"  <code>{re_item.get('time', '')}</code> "
+                     f"{re_item.get('model', '?')[:12]}: {re_item.get('message', '')[:35]}")
     elif error_data:
-        lines3 += [
-            "",
-            "━━ <b>错误分析</b> ━━━━━━━━━",
-            f"成功率: <b>100%</b> (无错误)",
-        ]
+        L.append(f"\n成功率 <b>100%</b> (无错误)")
 
-    lines3 += [
-        "",
-        f"<i>生成时间: {now.strftime('%Y-%m-%d %H:%M')} 北京时间</i>",
-    ]
+    L.append(f"\n<i>{now.strftime('%Y-%m-%d %H:%M')} CST</i>")
 
     # ─── Send ────────────────────────────────────────────────
-    msgs = ["\n".join(lines1), "\n".join(lines2), "\n".join(lines3)]
-    ok_count = 0
-    for i, msg in enumerate(msgs, 1):
-        print(f"  Sending msg {i} ({len(msg)} chars)...")
-        r = tg_send(msg)
-        if r.get("ok"):
-            ok_count += 1
-        else:
-            print(f"  FAILED: {r}")
+    msg = "\n".join(L)
+    print(f"  Message length: {len(msg)} chars")
 
-    print(f"Done: {ok_count}/{len(msgs)} messages sent.")
-    return 0 if ok_count == len(msgs) else 1
+    # 如果超过4096字符，截断并标注
+    if len(msg) > 4090:
+        msg = msg[:4080] + "\n..."
+        print(f"  Truncated to {len(msg)} chars")
+
+    r = tg_send(msg)
+    if r.get("ok"):
+        print("Done: message sent.")
+        return 0
+    else:
+        print(f"  FAILED: {r}")
+        return 1
 
 
 if __name__ == "__main__":
