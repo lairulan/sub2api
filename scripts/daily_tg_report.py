@@ -200,80 +200,81 @@ def main():
         filled = int(pct / 100 * w)
         return "\u2588" * filled + "\u2591" * (w - filled)
 
-    # Message 1: Overview + Accounts + Peak
+    # 消息1: 总览 + 上游账号 + 高峰时段
     lines1 = [
-        "<b>neo-faheng Daily Report</b>",
+        f"<b>neo-法恒 每日运营报告</b>",
         f"<code>{yesterday}</code> | relay.0xfaheng.xyz",
         "",
-        "\u2501\u2501 <b>Overview</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        f"Requests:    <b>{total_req}</b>",
-        f"Tokens:      <b>{fmt_n(total_tokens)}</b>",
-        f"Cost:        <b>{fmt_c(total_cost)}</b>",
-        f"Avg Resp:    <b>{avg_dur:.1f}s</b>",
-        f"Active Keys: <b>{len(key_trend)}</b>",
-        f"Users:       {active_users} active / {total_users} total",
-        f"Uptime:      {uptime_d}d {uptime_h % 24}h",
-        f"Cumulative:  {fmt_c(cum_cost)} / {fmt_n(cum_req)} req",
+        "━━ <b>总览</b> ━━━━━━━━━━━━",
+        f"请求数:    <b>{total_req}</b>",
+        f"Token消耗: <b>{fmt_n(total_tokens)}</b>",
+        f"费用:      <b>{fmt_c(total_cost)}</b>",
+        f"平均响应:  <b>{avg_dur:.1f}秒</b>",
+        f"活跃Key:   <b>{len(key_trend)}个</b>",
+        f"用户:      {active_users}活跃 / {total_users}总计",
+        f"运行时长:  {uptime_d}天{uptime_h % 24}小时",
+        f"累计总计:  {fmt_c(cum_cost)} / {fmt_n(cum_req)}次请求",
     ]
 
-    # Accounts status
+    # 上游账号状态
     acct_ok = sum(1 for a in accounts if a.get("status") == "active")
     acct_total = len(accounts)
     lines1 += [
         "",
-        f"\u2501\u2501 <b>Upstream</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        f"Accounts: {acct_ok}/{acct_total} active" +
-            (f" ({acct_total - acct_ok} error!)" if acct_ok < acct_total else " (all OK)"),
+        "━━ <b>上游账号</b> ━━━━━━━━━",
+        f"状态: {acct_ok}/{acct_total}正常" +
+            (f" ({acct_total - acct_ok}个异常!)" if acct_ok < acct_total else " (全部正常)"),
     ]
     for a in accounts:
         name = a.get("name", "?")
         status = a.get("status", "?")
+        status_cn = "正常" if status == "active" else "异常"
         dot = "+" if status == "active" else "!"
         err = a.get("error_message", "")
         extra = f" - {err[:25]}" if err else ""
-        lines1.append(f"  [{dot}] {name}: {status}{extra}")
+        lines1.append(f"  [{dot}] {name}: {status_cn}{extra}")
 
-    # Peak hours
+    # 高峰时段
     if peak_h:
         lines1 += [
             "",
-            f"\u2501\u2501 <b>Peak</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-            f"Most Req:  {peak_h} ({peak_req_h} req)",
-            f"High Cost: {peak_cost_h} ({fmt_c(peak_cost_v)})",
+            "━━ <b>高峰时段</b> ━━━━━━━━━",
+            f"最多请求: {peak_h} ({peak_req_h}次)",
+            f"最高费用: {peak_cost_h} ({fmt_c(peak_cost_v)})",
         ]
 
-    # Message 2: Models + Keys + Groups
-    lines2 = [f"<b>Model Usage</b> ({yesterday})", ""]
+    # 消息2: 模型 + Key + 分组
+    lines2 = [f"<b>模型使用分布</b> ({yesterday})", ""]
     for m in sorted(model_list, key=lambda x: x.get("cost", 0), reverse=True):
         name = m.get("model", "?")
         mreq = m.get("requests", 0)
         mcost = m.get("cost", 0)
         pct = (mcost / total_cost * 100) if total_cost > 0 else 0
         lines2.append(
-            f"  <code>{name[:20]:20s}</code> {mreq:>3}req {fmt_c(mcost):>7} ({pct:.0f}%)"
+            f"  <code>{name[:20]:20s}</code> {mreq:>3}次 {fmt_c(mcost):>7} ({pct:.0f}%)"
         )
 
-    lines2 += ["", "\u2501\u2501 <b>API Keys</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501", ""]
+    lines2 += ["", "━━ <b>API Key 用量</b> ━━━━━━━", ""]
     for k in sorted(key_trend, key=lambda x: x.get("requests", 0), reverse=True):
         kname = k.get("key_name", k.get("name", "?"))
         kreq = k.get("requests", 0)
         ktok = k.get("tokens", 0)
         pct = (kreq / total_req * 100) if total_req > 0 else 0
         lines2.append(
-            f"  <code>{kname[:12]:12s}</code> {kreq:>3}req {fmt_n(ktok):>6}tok ({pct:.0f}%)"
+            f"  <code>{kname[:12]:12s}</code> {kreq:>3}次 {fmt_n(ktok):>6}tok ({pct:.0f}%)"
         )
 
-    lines2 += ["", "\u2501\u2501 <b>Groups</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501", ""]
+    lines2 += ["", "━━ <b>分组统计</b> ━━━━━━━━━━", ""]
     for g in sorted(group_list, key=lambda x: x.get("cost", 0), reverse=True):
         gname = g.get("group_name", g.get("group", "?"))
         greq = g.get("requests", 0)
         gcost = g.get("cost", 0)
         lines2.append(
-            f"  <code>{gname[:12]:12s}</code> {greq:>3}req {fmt_c(gcost):>7}"
+            f"  <code>{gname[:12]:12s}</code> {greq:>3}次 {fmt_c(gcost):>7}"
         )
 
-    # Message 3: Users + Weekly Trend
-    lines3 = [f"<b>User Ranking</b> ({yesterday})", ""]
+    # 消息3: 用户排名 + 7天趋势
+    lines3 = [f"<b>用户费用排名</b> ({yesterday})", ""]
     for i, u in enumerate(user_list[:10], 1):
         email = u.get("email", "?")
         at_pos = email.find("@")
@@ -284,13 +285,13 @@ def main():
         ureq = u.get("requests", 0)
         ucost = u.get("cost", 0)
         lines3.append(
-            f"  {i}. <code>{masked[:22]:22s}</code> {ureq:>3}req {fmt_c(ucost):>7}"
+            f"  {i}. <code>{masked[:22]:22s}</code> {ureq:>3}次 {fmt_c(ucost):>7}"
         )
 
     lines3 += [
         "",
-        f"\u2501\u2501 <b>7-Day Trend</b> \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
-        f"Total: {fmt_c(w_cost)} / {fmt_n(w_req)} req",
+        "━━ <b>近7天趋势</b> ━━━━━━━━",
+        f"合计: {fmt_c(w_cost)} / {fmt_n(w_req)}次请求",
         ""
     ]
     max_req_w = max((d.get("requests", 0) for d in weekly), default=1)
@@ -302,12 +303,12 @@ def main():
         b = "\u2588" * blen + "\u2591" * (10 - blen)
         mark = " <b>\u25c0</b>" if dd == yesterday[-5:] else ""
         lines3.append(
-            f"  <code>{dd} {b}</code> {dreq:>4}req {fmt_c(dcost):>7}{mark}"
+            f"  <code>{dd} {b}</code> {dreq:>4}次 {fmt_c(dcost):>7}{mark}"
         )
 
     lines3 += [
         "",
-        f"<i>{now.strftime('%Y-%m-%d %H:%M')} CST</i>",
+        f"<i>生成时间: {now.strftime('%Y-%m-%d %H:%M')} 北京时间</i>",
     ]
 
     # ─── Send ────────────────────────────────────────────────
