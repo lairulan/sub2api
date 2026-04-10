@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -154,10 +155,6 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldImagePrice1k,
 				group.FieldImagePrice2k,
 				group.FieldImagePrice4k,
-				group.FieldSoraImagePrice360,
-				group.FieldSoraImagePrice540,
-				group.FieldSoraVideoPricePerRequest,
-				group.FieldSoraVideoPricePerRequestHd,
 				group.FieldClaudeCodeOnly,
 				group.FieldFallbackGroupID,
 				group.FieldFallbackGroupIDOnInvalidRequest,
@@ -165,6 +162,8 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldModelRouting,
 				group.FieldMcpXMLInject,
 				group.FieldSupportedModelScopes,
+				group.FieldAllowMessagesDispatch,
+				group.FieldDefaultMappedModel,
 			)
 		}).
 		Only(ctx)
@@ -255,9 +254,12 @@ func (r *apiKeyRepository) Update(ctx context.Context, key *service.APIKey) erro
 }
 
 func (r *apiKeyRepository) Delete(ctx context.Context, id int64) error {
+	// 存在唯一键约束 生成tombstone key 用来释放原key，长度远小于 128，满足 schema 限制
+	tombstoneKey := fmt.Sprintf("__deleted__%d__%d", id, time.Now().UnixNano())
 	// 显式软删除：避免依赖 Hook 行为，确保 deleted_at 一定被设置。
 	affected, err := r.client.APIKey.Update().
 		Where(apikey.IDEQ(id), apikey.DeletedAtIsNil()).
+		SetKey(tombstoneKey).
 		SetDeletedAt(time.Now()).
 		Save(ctx)
 	if err != nil {
@@ -407,6 +409,16 @@ func (r *apiKeyRepository) ClearGroupIDByGroupID(ctx context.Context, groupID in
 	return int64(n), err
 }
 
+// UpdateGroupIDByUserAndGroup 将用户下绑定 oldGroupID 的所有 Key 迁移到 newGroupID
+func (r *apiKeyRepository) UpdateGroupIDByUserAndGroup(ctx context.Context, userID, oldGroupID, newGroupID int64) (int64, error) {
+	client := clientFromContext(ctx, r.client)
+	n, err := client.APIKey.Update().
+		Where(apikey.UserIDEQ(userID), apikey.GroupIDEQ(oldGroupID), apikey.DeletedAtIsNil()).
+		SetGroupID(newGroupID).
+		Save(ctx)
+	return int64(n), err
+}
+
 // CountByGroupID 获取分组的 API Key 数量
 func (r *apiKeyRepository) CountByGroupID(ctx context.Context, groupID int64) (int64, error) {
 	count, err := r.activeQuery().Where(apikey.GroupIDEQ(groupID)).Count(ctx)
@@ -450,6 +462,32 @@ func (r *apiKeyRepository) IncrementQuotaUsed(ctx context.Context, id int64, amo
 	return updated.QuotaUsed, nil
 }
 
+// IncrementQuotaUsedAndGetState atomically increments quota_used, conditionally marks the key
+// as quota_exhausted, and returns the latest quota state in one round trip.
+func (r *apiKeyRepository) IncrementQuotaUsedAndGetState(ctx context.Context, id int64, amount float64) (*service.APIKeyQuotaUsageState, error) {
+	query := `
+		UPDATE api_keys
+		SET
+			quota_used = quota_used + $1,
+			status = CASE
+				WHEN quota > 0 AND quota_used + $1 >= quota THEN $2
+				ELSE status
+			END,
+			updated_at = NOW()
+		WHERE id = $3 AND deleted_at IS NULL
+		RETURNING quota_used, quota, key, status
+	`
+
+	state := &service.APIKeyQuotaUsageState{}
+	if err := scanSingleRow(ctx, r.sql, query, []any{amount, service.StatusAPIKeyQuotaExhausted, id}, &state.QuotaUsed, &state.Quota, &state.Key, &state.Status); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, service.ErrAPIKeyNotFound
+		}
+		return nil, err
+	}
+	return state, nil
+}
+
 func (r *apiKeyRepository) UpdateLastUsed(ctx context.Context, id int64, usedAt time.Time) error {
 	affected, err := r.client.APIKey.Update().
 		Where(apikey.IDEQ(id), apikey.DeletedAtIsNil()).
@@ -470,12 +508,12 @@ func (r *apiKeyRepository) UpdateLastUsed(ctx context.Context, id int64, usedAt 
 func (r *apiKeyRepository) IncrementRateLimitUsage(ctx context.Context, id int64, cost float64) error {
 	_, err := r.sql.ExecContext(ctx, `
 		UPDATE api_keys SET
-			usage_5h = usage_5h + $1,
-			usage_1d = usage_1d + $1,
-			usage_7d = usage_7d + $1,
-			window_5h_start = COALESCE(window_5h_start, NOW()),
-			window_1d_start = COALESCE(window_1d_start, NOW()),
-			window_7d_start = COALESCE(window_7d_start, NOW()),
+			usage_5h = CASE WHEN window_5h_start IS NOT NULL AND window_5h_start + INTERVAL '5 hours' <= NOW() THEN $1 ELSE usage_5h + $1 END,
+			usage_1d = CASE WHEN window_1d_start IS NOT NULL AND window_1d_start + INTERVAL '24 hours' <= NOW() THEN $1 ELSE usage_1d + $1 END,
+			usage_7d = CASE WHEN window_7d_start IS NOT NULL AND window_7d_start + INTERVAL '7 days' <= NOW() THEN $1 ELSE usage_7d + $1 END,
+			window_5h_start = CASE WHEN window_5h_start IS NULL OR window_5h_start + INTERVAL '5 hours' <= NOW() THEN NOW() ELSE window_5h_start END,
+			window_1d_start = CASE WHEN window_1d_start IS NULL OR window_1d_start + INTERVAL '24 hours' <= NOW() THEN date_trunc('day', NOW()) ELSE window_1d_start END,
+			window_7d_start = CASE WHEN window_7d_start IS NULL OR window_7d_start + INTERVAL '7 days' <= NOW() THEN date_trunc('day', NOW()) ELSE window_7d_start END,
 			updated_at = NOW()
 		WHERE id = $2 AND deleted_at IS NULL`,
 		cost, id)
@@ -489,9 +527,9 @@ func (r *apiKeyRepository) ResetRateLimitWindows(ctx context.Context, id int64) 
 			usage_5h = CASE WHEN window_5h_start IS NOT NULL AND window_5h_start + INTERVAL '5 hours' <= NOW() THEN 0 ELSE usage_5h END,
 			window_5h_start = CASE WHEN window_5h_start IS NOT NULL AND window_5h_start + INTERVAL '5 hours' <= NOW() THEN NOW() ELSE window_5h_start END,
 			usage_1d = CASE WHEN window_1d_start IS NOT NULL AND window_1d_start + INTERVAL '24 hours' <= NOW() THEN 0 ELSE usage_1d END,
-			window_1d_start = CASE WHEN window_1d_start IS NOT NULL AND window_1d_start + INTERVAL '24 hours' <= NOW() THEN NOW() ELSE window_1d_start END,
+			window_1d_start = CASE WHEN window_1d_start IS NOT NULL AND window_1d_start + INTERVAL '24 hours' <= NOW() THEN date_trunc('day', NOW()) ELSE window_1d_start END,
 			usage_7d = CASE WHEN window_7d_start IS NOT NULL AND window_7d_start + INTERVAL '7 days' <= NOW() THEN 0 ELSE usage_7d END,
-			window_7d_start = CASE WHEN window_7d_start IS NOT NULL AND window_7d_start + INTERVAL '7 days' <= NOW() THEN NOW() ELSE window_7d_start END,
+			window_7d_start = CASE WHEN window_7d_start IS NOT NULL AND window_7d_start + INTERVAL '7 days' <= NOW() THEN date_trunc('day', NOW()) ELSE window_7d_start END,
 			updated_at = NOW()
 		WHERE id = $1 AND deleted_at IS NULL`,
 		id)
@@ -566,22 +604,20 @@ func userEntityToService(u *dbent.User) *service.User {
 		return nil
 	}
 	return &service.User{
-		ID:                    u.ID,
-		Email:                 u.Email,
-		Username:              u.Username,
-		Notes:                 u.Notes,
-		PasswordHash:          u.PasswordHash,
-		Role:                  u.Role,
-		Balance:               u.Balance,
-		Concurrency:           u.Concurrency,
-		Status:                u.Status,
-		SoraStorageQuotaBytes: u.SoraStorageQuotaBytes,
-		SoraStorageUsedBytes:  u.SoraStorageUsedBytes,
-		TotpSecretEncrypted:   u.TotpSecretEncrypted,
-		TotpEnabled:           u.TotpEnabled,
-		TotpEnabledAt:         u.TotpEnabledAt,
-		CreatedAt:             u.CreatedAt,
-		UpdatedAt:             u.UpdatedAt,
+		ID:                  u.ID,
+		Email:               u.Email,
+		Username:            u.Username,
+		Notes:               u.Notes,
+		PasswordHash:        u.PasswordHash,
+		Role:                u.Role,
+		Balance:             u.Balance,
+		Concurrency:         u.Concurrency,
+		Status:              u.Status,
+		TotpSecretEncrypted: u.TotpSecretEncrypted,
+		TotpEnabled:         u.TotpEnabled,
+		TotpEnabledAt:       u.TotpEnabledAt,
+		CreatedAt:           u.CreatedAt,
+		UpdatedAt:           u.UpdatedAt,
 	}
 }
 
@@ -605,11 +641,6 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		ImagePrice1K:                    g.ImagePrice1k,
 		ImagePrice2K:                    g.ImagePrice2k,
 		ImagePrice4K:                    g.ImagePrice4k,
-		SoraImagePrice360:               g.SoraImagePrice360,
-		SoraImagePrice540:               g.SoraImagePrice540,
-		SoraVideoPricePerRequest:        g.SoraVideoPricePerRequest,
-		SoraVideoPricePerRequestHD:      g.SoraVideoPricePerRequestHd,
-		SoraStorageQuotaBytes:           g.SoraStorageQuotaBytes,
 		DefaultValidityDays:             g.DefaultValidityDays,
 		ClaudeCodeOnly:                  g.ClaudeCodeOnly,
 		FallbackGroupID:                 g.FallbackGroupID,
@@ -619,6 +650,10 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		MCPXMLInject:                    g.McpXMLInject,
 		SupportedModelScopes:            g.SupportedModelScopes,
 		SortOrder:                       g.SortOrder,
+		AllowMessagesDispatch:           g.AllowMessagesDispatch,
+		RequireOAuthOnly:                g.RequireOauthOnly,
+		RequirePrivacySet:               g.RequirePrivacySet,
+		DefaultMappedModel:              g.DefaultMappedModel,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}

@@ -123,7 +123,8 @@
                 </router-link>
 
                 <a
-                  href="https://github.com/lairulan/0xfaheng"
+                  v-if="authStore.isAdmin"
+                  href="https://github.com/lairulan/sub2api"
                   target="_blank"
                   rel="noopener noreferrer"
                   @click="closeDropdown"
@@ -138,6 +139,7 @@
                   </svg>
                   {{ t('nav.github') }}
                 </a>
+
               </div>
 
               <!-- Contact Support (only show if configured) -->

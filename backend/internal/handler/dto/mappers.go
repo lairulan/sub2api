@@ -59,11 +59,9 @@ func UserFromServiceAdmin(u *service.User) *AdminUser {
 		return nil
 	}
 	return &AdminUser{
-		User:                  *base,
-		Notes:                 u.Notes,
-		GroupRates:            u.GroupRates,
-		SoraStorageQuotaBytes: u.SoraStorageQuotaBytes,
-		SoraStorageUsedBytes:  u.SoraStorageUsedBytes,
+		User:       *base,
+		Notes:      u.Notes,
+		GroupRates: u.GroupRates,
 	}
 }
 
@@ -71,7 +69,7 @@ func APIKeyFromService(k *service.APIKey) *APIKey {
 	if k == nil {
 		return nil
 	}
-	return &APIKey{
+	out := &APIKey{
 		ID:            k.ID,
 		UserID:        k.UserID,
 		Key:           k.Key,
@@ -89,15 +87,28 @@ func APIKeyFromService(k *service.APIKey) *APIKey {
 		RateLimit5h:   k.RateLimit5h,
 		RateLimit1d:   k.RateLimit1d,
 		RateLimit7d:   k.RateLimit7d,
-		Usage5h:       k.Usage5h,
-		Usage1d:       k.Usage1d,
-		Usage7d:       k.Usage7d,
+		Usage5h:       k.EffectiveUsage5h(),
+		Usage1d:       k.EffectiveUsage1d(),
+		Usage7d:       k.EffectiveUsage7d(),
 		Window5hStart: k.Window5hStart,
 		Window1dStart: k.Window1dStart,
 		Window7dStart: k.Window7dStart,
 		User:          UserFromServiceShallow(k.User),
 		Group:         GroupFromServiceShallow(k.Group),
 	}
+	if k.Window5hStart != nil && !service.IsWindowExpired(k.Window5hStart, service.RateLimitWindow5h) {
+		t := k.Window5hStart.Add(service.RateLimitWindow5h)
+		out.Reset5hAt = &t
+	}
+	if k.Window1dStart != nil && !service.IsWindowExpired(k.Window1dStart, service.RateLimitWindow1d) {
+		t := k.Window1dStart.Add(service.RateLimitWindow1d)
+		out.Reset1dAt = &t
+	}
+	if k.Window7dStart != nil && !service.IsWindowExpired(k.Window7dStart, service.RateLimitWindow7d) {
+		t := k.Window7dStart.Add(service.RateLimitWindow7d)
+		out.Reset7dAt = &t
+	}
+	return out
 }
 
 func GroupFromServiceShallow(g *service.Group) *Group {
@@ -122,13 +133,17 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		return nil
 	}
 	out := &AdminGroup{
-		Group:                groupFromServiceBase(g),
-		ModelRouting:         g.ModelRouting,
-		ModelRoutingEnabled:  g.ModelRoutingEnabled,
-		MCPXMLInject:         g.MCPXMLInject,
-		SupportedModelScopes: g.SupportedModelScopes,
-		AccountCount:         g.AccountCount,
-		SortOrder:            g.SortOrder,
+		Group:                       groupFromServiceBase(g),
+		ModelRouting:                g.ModelRouting,
+		ModelRoutingEnabled:         g.ModelRoutingEnabled,
+		MCPXMLInject:                g.MCPXMLInject,
+		DefaultMappedModel:          g.DefaultMappedModel,
+		MessagesDispatchModelConfig: g.MessagesDispatchModelConfig,
+		SupportedModelScopes:        g.SupportedModelScopes,
+		AccountCount:                g.AccountCount,
+		ActiveAccountCount:          g.ActiveAccountCount,
+		RateLimitedAccountCount:     g.RateLimitedAccountCount,
+		SortOrder:                   g.SortOrder,
 	}
 	if len(g.AccountGroups) > 0 {
 		out.AccountGroups = make([]AccountGroup, 0, len(g.AccountGroups))
@@ -156,14 +171,12 @@ func groupFromServiceBase(g *service.Group) Group {
 		ImagePrice1K:                    g.ImagePrice1K,
 		ImagePrice2K:                    g.ImagePrice2K,
 		ImagePrice4K:                    g.ImagePrice4K,
-		SoraImagePrice360:               g.SoraImagePrice360,
-		SoraImagePrice540:               g.SoraImagePrice540,
-		SoraVideoPricePerRequest:        g.SoraVideoPricePerRequest,
-		SoraVideoPricePerRequestHD:      g.SoraVideoPricePerRequestHD,
 		ClaudeCodeOnly:                  g.ClaudeCodeOnly,
 		FallbackGroupID:                 g.FallbackGroupID,
 		FallbackGroupIDOnInvalidRequest: g.FallbackGroupIDOnInvalidRequest,
-		SoraStorageQuotaBytes:           g.SoraStorageQuotaBytes,
+		AllowMessagesDispatch:           g.AllowMessagesDispatch,
+		RequireOAuthOnly:                g.RequireOAuthOnly,
+		RequirePrivacySet:               g.RequirePrivacySet,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}
@@ -183,6 +196,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		Extra:                   a.Extra,
 		ProxyID:                 a.ProxyID,
 		Concurrency:             a.Concurrency,
+		LoadFactor:              a.LoadFactor,
 		Priority:                a.Priority,
 		RateMultiplier:          a.BillingRateMultiplier(),
 		Status:                  a.Status,
@@ -234,6 +248,10 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 			enabled := true
 			out.EnableTLSFingerprint = &enabled
 		}
+		// TLS指纹模板ID
+		if profileID := a.GetTLSFingerprintProfileID(); profileID > 0 {
+			out.TLSFingerprintProfileID = &profileID
+		}
 		// 会话ID伪装开关
 		if a.IsSessionIDMaskingEnabled() {
 			enabled := true
@@ -245,6 +263,64 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 			out.CacheTTLOverrideEnabled = &enabled
 			target := a.GetCacheTTLOverrideTarget()
 			out.CacheTTLOverrideTarget = &target
+		}
+		// 自定义 Base URL 中继转发
+		if a.IsCustomBaseURLEnabled() {
+			enabled := true
+			out.CustomBaseURLEnabled = &enabled
+			if customURL := a.GetCustomBaseURL(); customURL != "" {
+				out.CustomBaseURL = &customURL
+			}
+		}
+	}
+
+	// 提取账号配额限制（apikey / bedrock 类型有效）
+	if a.IsAPIKeyOrBedrock() {
+		if limit := a.GetQuotaLimit(); limit > 0 {
+			out.QuotaLimit = &limit
+			used := a.GetQuotaUsed()
+			out.QuotaUsed = &used
+		}
+		if limit := a.GetQuotaDailyLimit(); limit > 0 {
+			out.QuotaDailyLimit = &limit
+			used := a.GetQuotaDailyUsed()
+			if a.IsDailyQuotaPeriodExpired() {
+				used = 0
+			}
+			out.QuotaDailyUsed = &used
+		}
+		if limit := a.GetQuotaWeeklyLimit(); limit > 0 {
+			out.QuotaWeeklyLimit = &limit
+			used := a.GetQuotaWeeklyUsed()
+			if a.IsWeeklyQuotaPeriodExpired() {
+				used = 0
+			}
+			out.QuotaWeeklyUsed = &used
+		}
+		// 固定时间重置配置
+		if mode := a.GetQuotaDailyResetMode(); mode == "fixed" {
+			out.QuotaDailyResetMode = &mode
+			hour := a.GetQuotaDailyResetHour()
+			out.QuotaDailyResetHour = &hour
+		}
+		if mode := a.GetQuotaWeeklyResetMode(); mode == "fixed" {
+			out.QuotaWeeklyResetMode = &mode
+			day := a.GetQuotaWeeklyResetDay()
+			out.QuotaWeeklyResetDay = &day
+			hour := a.GetQuotaWeeklyResetHour()
+			out.QuotaWeeklyResetHour = &hour
+		}
+		if a.GetQuotaDailyResetMode() == "fixed" || a.GetQuotaWeeklyResetMode() == "fixed" {
+			tz := a.GetQuotaResetTimezone()
+			out.QuotaResetTimezone = &tz
+		}
+		if a.Extra != nil {
+			if v, ok := a.Extra["quota_daily_reset_at"].(string); ok && v != "" {
+				out.QuotaDailyResetAt = &v
+			}
+			if v, ok := a.Extra["quota_weekly_reset_at"].(string); ok && v != "" {
+				out.QuotaWeeklyResetAt = &v
+			}
 		}
 	}
 
@@ -454,14 +530,21 @@ func usageLogFromServiceUser(l *service.UsageLog) UsageLog {
 	// 普通用户 DTO：严禁包含管理员字段（例如 account_rate_multiplier、ip_address、account）。
 	requestType := l.EffectiveRequestType()
 	stream, openAIWSMode := service.ApplyLegacyRequestFields(requestType, l.Stream, l.OpenAIWSMode)
+	requestedModel := l.RequestedModel
+	if requestedModel == "" {
+		requestedModel = l.Model
+	}
 	return UsageLog{
 		ID:                    l.ID,
 		UserID:                l.UserID,
 		APIKeyID:              l.APIKeyID,
 		AccountID:             l.AccountID,
 		RequestID:             l.RequestID,
-		Model:                 l.Model,
+		Model:                 requestedModel,
+		ServiceTier:           l.ServiceTier,
 		ReasoningEffort:       l.ReasoningEffort,
+		InboundEndpoint:       l.InboundEndpoint,
+		UpstreamEndpoint:      l.UpstreamEndpoint,
 		GroupID:               l.GroupID,
 		SubscriptionID:        l.SubscriptionID,
 		InputTokens:           l.InputTokens,
@@ -488,6 +571,7 @@ func usageLogFromServiceUser(l *service.UsageLog) UsageLog {
 		MediaType:             l.MediaType,
 		UserAgent:             l.UserAgent,
 		CacheTTLOverridden:    l.CacheTTLOverridden,
+		BillingMode:           l.BillingMode,
 		CreatedAt:             l.CreatedAt,
 		User:                  UserFromServiceShallow(l.User),
 		APIKey:                APIKeyFromService(l.APIKey),
@@ -514,6 +598,10 @@ func UsageLogFromServiceAdmin(l *service.UsageLog) *AdminUsageLog {
 	}
 	return &AdminUsageLog{
 		UsageLog:              usageLogFromServiceUser(l),
+		UpstreamModel:         l.UpstreamModel,
+		ChannelID:             l.ChannelID,
+		ModelMappingChain:     l.ModelMappingChain,
+		BillingTier:           l.BillingTier,
 		AccountRateMultiplier: l.AccountRateMultiplier,
 		IPAddress:             l.IPAddress,
 		Account:               AccountSummaryFromService(l.Account),

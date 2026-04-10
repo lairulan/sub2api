@@ -404,6 +404,167 @@ func TestFilterThinkingBlocksForRetry_EmptyContentGetsPlaceholder(t *testing.T) 
 	require.NotEmpty(t, content0["text"])
 }
 
+func TestFilterThinkingBlocksForRetry_StripsEmptyTextBlocks(t *testing.T) {
+	// Empty text blocks cause upstream 400: "text content blocks must be non-empty"
+	input := []byte(`{
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":""}]},
+			{"role":"assistant","content":[{"type":"text","text":""}]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	msgs, ok := req["messages"].([]any)
+	require.True(t, ok)
+
+	// First message: empty text block stripped, "hello" preserved
+	msg0 := msgs[0].(map[string]any)
+	content0 := msg0["content"].([]any)
+	require.Len(t, content0, 1)
+	require.Equal(t, "hello", content0[0].(map[string]any)["text"])
+
+	// Second message: only had empty text block → gets placeholder
+	msg1 := msgs[1].(map[string]any)
+	content1 := msg1["content"].([]any)
+	require.Len(t, content1, 1)
+	block1 := content1[0].(map[string]any)
+	require.Equal(t, "text", block1["type"])
+	require.NotEmpty(t, block1["text"])
+}
+
+func TestFilterThinkingBlocksForRetry_StripsNestedEmptyTextInToolResult(t *testing.T) {
+	// Empty text blocks nested inside tool_result content should also be stripped
+	input := []byte(`{
+		"messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"t1","content":[
+					{"type":"text","text":"valid result"},
+					{"type":"text","text":""}
+				]}
+			]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	msgs := req["messages"].([]any)
+	msg0 := msgs[0].(map[string]any)
+	content0 := msg0["content"].([]any)
+	require.Len(t, content0, 1)
+	toolResult := content0[0].(map[string]any)
+	require.Equal(t, "tool_result", toolResult["type"])
+	nestedContent := toolResult["content"].([]any)
+	require.Len(t, nestedContent, 1)
+	require.Equal(t, "valid result", nestedContent[0].(map[string]any)["text"])
+}
+
+func TestFilterThinkingBlocksForRetry_NestedAllEmptyGetsEmptySlice(t *testing.T) {
+	// If all nested content blocks in tool_result are empty text, content becomes empty slice
+	input := []byte(`{
+		"messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"t1","content":[
+					{"type":"text","text":""}
+				]},
+				{"type":"text","text":"hello"}
+			]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	msgs := req["messages"].([]any)
+	msg0 := msgs[0].(map[string]any)
+	content0 := msg0["content"].([]any)
+	require.Len(t, content0, 2)
+	toolResult := content0[0].(map[string]any)
+	nestedContent := toolResult["content"].([]any)
+	require.Len(t, nestedContent, 0)
+}
+
+func TestStripEmptyTextBlocks(t *testing.T) {
+	t.Run("strips top-level empty text", func(t *testing.T) {
+		input := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":""}]}]}`)
+		out := StripEmptyTextBlocks(input)
+		var req map[string]any
+		require.NoError(t, json.Unmarshal(out, &req))
+		msgs := req["messages"].([]any)
+		content := msgs[0].(map[string]any)["content"].([]any)
+		require.Len(t, content, 1)
+		require.Equal(t, "hello", content[0].(map[string]any)["text"])
+	})
+
+	t.Run("strips nested empty text in tool_result", func(t *testing.T) {
+		input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"ok"},{"type":"text","text":""}]}]}]}`)
+		out := StripEmptyTextBlocks(input)
+		var req map[string]any
+		require.NoError(t, json.Unmarshal(out, &req))
+		msgs := req["messages"].([]any)
+		content := msgs[0].(map[string]any)["content"].([]any)
+		toolResult := content[0].(map[string]any)
+		nestedContent := toolResult["content"].([]any)
+		require.Len(t, nestedContent, 1)
+		require.Equal(t, "ok", nestedContent[0].(map[string]any)["text"])
+	})
+
+	t.Run("no-op when no empty text", func(t *testing.T) {
+		input := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+		out := StripEmptyTextBlocks(input)
+		require.Equal(t, input, out)
+	})
+
+	t.Run("preserves non-map blocks in content", func(t *testing.T) {
+		// tool_result content can be a string; non-map blocks should pass through unchanged
+		input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"string content"},{"type":"text","text":""}]}]}`)
+		out := StripEmptyTextBlocks(input)
+		var req map[string]any
+		require.NoError(t, json.Unmarshal(out, &req))
+		msgs := req["messages"].([]any)
+		content := msgs[0].(map[string]any)["content"].([]any)
+		require.Len(t, content, 1)
+		toolResult := content[0].(map[string]any)
+		require.Equal(t, "tool_result", toolResult["type"])
+		require.Equal(t, "string content", toolResult["content"])
+	})
+
+	t.Run("handles deeply nested tool_result", func(t *testing.T) {
+		// Recursive: tool_result containing another tool_result with empty text
+		input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":""},{"type":"text","text":"deep"}]}]}]}]}`)
+		out := StripEmptyTextBlocks(input)
+		var req map[string]any
+		require.NoError(t, json.Unmarshal(out, &req))
+		msgs := req["messages"].([]any)
+		content := msgs[0].(map[string]any)["content"].([]any)
+		outer := content[0].(map[string]any)
+		innerContent := outer["content"].([]any)
+		inner := innerContent[0].(map[string]any)
+		deepContent := inner["content"].([]any)
+		require.Len(t, deepContent, 1)
+		require.Equal(t, "deep", deepContent[0].(map[string]any)["text"])
+	})
+}
+
+func TestFilterThinkingBlocksForRetry_PreservesNonEmptyTextBlocks(t *testing.T) {
+	// Non-empty text blocks should pass through unchanged
+	input := []byte(`{
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	// Fast path: no thinking content, no empty content, no empty text blocks → unchanged
+	require.Equal(t, input, out)
+}
+
 func TestFilterSignatureSensitiveBlocksForRetry_DowngradesTools(t *testing.T) {
 	input := []byte(`{
 		"thinking":{"type":"enabled","budget_tokens":1024},
@@ -437,6 +598,210 @@ func TestFilterSignatureSensitiveBlocksForRetry_DowngradesTools(t *testing.T) {
 	require.Equal(t, "text", content1["type"])
 	require.Contains(t, content0["text"], "tool_use")
 	require.Contains(t, content1["text"], "tool_result")
+}
+
+// ============ Group 6b: context_management.edits 清理测试 ============
+
+// removeThinkingDependentContextStrategies — 边界用例
+
+func TestRemoveThinkingDependentContextStrategies_NoContextManagement(t *testing.T) {
+	input := []byte(`{"thinking":{"type":"enabled"},"messages":[]}`)
+	out := removeThinkingDependentContextStrategies(input)
+	require.Equal(t, input, out, "无 context_management 字段时应原样返回")
+}
+
+func TestRemoveThinkingDependentContextStrategies_EmptyEdits(t *testing.T) {
+	input := []byte(`{"context_management":{"edits":[]},"messages":[]}`)
+	out := removeThinkingDependentContextStrategies(input)
+	require.Equal(t, input, out, "edits 为空数组时应原样返回")
+}
+
+func TestRemoveThinkingDependentContextStrategies_NoClearThinkingEntry(t *testing.T) {
+	input := []byte(`{"context_management":{"edits":[{"type":"other_strategy"}]},"messages":[]}`)
+	out := removeThinkingDependentContextStrategies(input)
+	require.Equal(t, input, out, "edits 中无 clear_thinking_20251015 时应原样返回")
+}
+
+func TestRemoveThinkingDependentContextStrategies_RemovesSingleEntry(t *testing.T) {
+	input := []byte(`{"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
+	out := removeThinkingDependentContextStrategies(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	_, hasEdits := cm["edits"]
+	require.False(t, hasEdits, "所有 edits 均为 clear_thinking_20251015 时应删除 edits 键")
+}
+
+func TestRemoveThinkingDependentContextStrategies_MixedEntries(t *testing.T) {
+	input := []byte(`{"context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"other_strategy","param":1}]},"messages":[]}`)
+	out := removeThinkingDependentContextStrategies(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	edits, ok := cm["edits"].([]any)
+	require.True(t, ok)
+	require.Len(t, edits, 1, "仅移除 clear_thinking_20251015，保留其他条目")
+	edit0, ok := edits[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "other_strategy", edit0["type"])
+}
+
+// FilterThinkingBlocksForRetry — 包含 context_management 的场景
+
+func TestFilterThinkingBlocksForRetry_RemovesClearThinkingStrategy_FastPath(t *testing.T) {
+	// 快速路径：messages 中无 thinking 块，仅有顶层 thinking 字段
+	// 这条路径曾因提前 return 跳过 removeThinkingDependentContextStrategies 而存在 bug
+	input := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"Hello"}]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	_, hasThinking := req["thinking"]
+	require.False(t, hasThinking, "顶层 thinking 应被移除")
+
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	_, hasEdits := cm["edits"]
+	require.False(t, hasEdits, "fast path 下 clear_thinking_20251015 应被移除，edits 键应被删除")
+}
+
+func TestFilterThinkingBlocksForRetry_RemovesClearThinkingStrategy_WithThinkingBlocks(t *testing.T) {
+	// 完整路径：messages 中有 thinking 块（非 fast path）
+	input := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"keep_this"}]},
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"some thought","signature":"sig"},
+				{"type":"text","text":"Answer"}
+			]}
+		]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	_, hasThinking := req["thinking"]
+	require.False(t, hasThinking, "顶层 thinking 应被移除")
+
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	edits, ok := cm["edits"].([]any)
+	require.True(t, ok)
+	require.Len(t, edits, 1, "仅移除 clear_thinking_20251015，保留 keep_this")
+	edit0, ok := edits[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "keep_this", edit0["type"])
+}
+
+func TestFilterThinkingBlocksForRetry_NoContextManagement_Unaffected(t *testing.T) {
+	// 无 context_management 时不应报错，且 thinking 正常被移除
+	input := []byte(`{
+		"thinking":{"type":"enabled"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]
+	}`)
+
+	out := FilterThinkingBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	_, hasThinking := req["thinking"]
+	require.False(t, hasThinking)
+	_, hasCM := req["context_management"]
+	require.False(t, hasCM)
+}
+
+// FilterSignatureSensitiveBlocksForRetry — 包含 context_management 的场景
+
+func TestFilterSignatureSensitiveBlocksForRetry_RemovesClearThinkingStrategy(t *testing.T) {
+	input := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"thought","signature":"sig"}
+			]}
+		]
+	}`)
+
+	out := FilterSignatureSensitiveBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	_, hasThinking := req["thinking"]
+	require.False(t, hasThinking, "顶层 thinking 应被移除")
+
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	if rawEdits, hasEdits := cm["edits"]; hasEdits {
+		edits, ok := rawEdits.([]any)
+		require.True(t, ok)
+		for _, e := range edits {
+			em, ok := e.(map[string]any)
+			require.True(t, ok)
+			require.NotEqual(t, "clear_thinking_20251015", em["type"], "clear_thinking_20251015 应被移除")
+		}
+	}
+}
+
+func TestFilterSignatureSensitiveBlocksForRetry_PreservesNonThinkingStrategies(t *testing.T) {
+	input := []byte(`{
+		"thinking":{"type":"enabled"},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"},{"type":"other_edit"}]},
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"t","signature":"s"}
+			]}
+		]
+	}`)
+
+	out := FilterSignatureSensitiveBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	edits, ok := cm["edits"].([]any)
+	require.True(t, ok)
+	require.Len(t, edits, 1, "仅移除 clear_thinking_20251015，保留 other_edit")
+	edit0, ok := edits[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "other_edit", edit0["type"])
+}
+
+func TestFilterSignatureSensitiveBlocksForRetry_NoThinkingField_ContextManagementUntouched(t *testing.T) {
+	// 没有顶层 thinking 字段时，context_management 不应被修改
+	input := []byte(`{
+		"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"t","signature":"s"}
+			]}
+		]
+	}`)
+
+	out := FilterSignatureSensitiveBlocksForRetry(input)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(out, &req))
+	cm, ok := req["context_management"].(map[string]any)
+	require.True(t, ok)
+	edits, ok := cm["edits"].([]any)
+	require.True(t, ok)
+	require.Len(t, edits, 1, "无顶层 thinking 时 context_management 不应被修改")
 }
 
 // ============ Group 7: ParseGatewayRequest 补充单元测试 ============
@@ -765,6 +1130,76 @@ func BenchmarkParseGatewayRequest_Old_Large(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = parseGatewayRequestOld(data, "")
+	}
+}
+
+func TestParseGatewayRequest_OutputEffort(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantEffort string
+	}{
+		{
+			name:       "output_config.effort present",
+			body:       `{"model":"claude-opus-4-6","output_config":{"effort":"medium"},"messages":[]}`,
+			wantEffort: "medium",
+		},
+		{
+			name:       "output_config.effort max",
+			body:       `{"model":"claude-opus-4-6","output_config":{"effort":"max"},"messages":[]}`,
+			wantEffort: "max",
+		},
+		{
+			name:       "output_config without effort",
+			body:       `{"model":"claude-opus-4-6","output_config":{},"messages":[]}`,
+			wantEffort: "",
+		},
+		{
+			name:       "no output_config",
+			body:       `{"model":"claude-opus-4-6","messages":[]}`,
+			wantEffort: "",
+		},
+		{
+			name:       "effort with whitespace trimmed",
+			body:       `{"model":"claude-opus-4-6","output_config":{"effort":" high "},"messages":[]}`,
+			wantEffort: "high",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := ParseGatewayRequest([]byte(tt.body), "")
+			require.NoError(t, err)
+			require.Equal(t, tt.wantEffort, parsed.OutputEffort)
+		})
+	}
+}
+
+func TestNormalizeClaudeOutputEffort(t *testing.T) {
+	tests := []struct {
+		input string
+		want  *string
+	}{
+		{"low", strPtr("low")},
+		{"medium", strPtr("medium")},
+		{"high", strPtr("high")},
+		{"max", strPtr("max")},
+		{"LOW", strPtr("low")},
+		{"Max", strPtr("max")},
+		{" medium ", strPtr("medium")},
+		{"", nil},
+		{"unknown", nil},
+		{"xhigh", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := NormalizeClaudeOutputEffort(tt.input)
+			if tt.want == nil {
+				require.Nil(t, got)
+			} else {
+				require.NotNil(t, got)
+				require.Equal(t, *tt.want, *got)
+			}
+		})
 	}
 }
 

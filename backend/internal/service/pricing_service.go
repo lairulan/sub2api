@@ -21,22 +21,57 @@ import (
 )
 
 var (
-	openAIModelDatePattern = regexp.MustCompile(`-\d{8}$`)
-	openAIModelBasePattern = regexp.MustCompile(`^(gpt-\d+(?:\.\d+)?)(?:-|$)`)
+	openAIModelDatePattern     = regexp.MustCompile(`-\d{8}$`)
+	openAIModelBasePattern     = regexp.MustCompile(`^(gpt-\d+(?:\.\d+)?)(?:-|$)`)
+	openAIGPT54FallbackPricing = &LiteLLMModelPricing{
+		InputCostPerToken:               2.5e-06, // $2.5 per MTok
+		OutputCostPerToken:              1.5e-05, // $15 per MTok
+		CacheReadInputTokenCost:         2.5e-07, // $0.25 per MTok
+		LongContextInputTokenThreshold:  272000,
+		LongContextInputCostMultiplier:  2.0,
+		LongContextOutputCostMultiplier: 1.5,
+		LiteLLMProvider:                 "openai",
+		Mode:                            "chat",
+		SupportsPromptCaching:           true,
+	}
+	openAIGPT54MiniFallbackPricing = &LiteLLMModelPricing{
+		InputCostPerToken:       7.5e-07,
+		OutputCostPerToken:      4.5e-06,
+		CacheReadInputTokenCost: 7.5e-08,
+		LiteLLMProvider:         "openai",
+		Mode:                    "chat",
+		SupportsPromptCaching:   true,
+	}
+	openAIGPT54NanoFallbackPricing = &LiteLLMModelPricing{
+		InputCostPerToken:       2e-07,
+		OutputCostPerToken:      1.25e-06,
+		CacheReadInputTokenCost: 2e-08,
+		LiteLLMProvider:         "openai",
+		Mode:                    "chat",
+		SupportsPromptCaching:   true,
+	}
 )
 
 // LiteLLMModelPricing LiteLLM价格数据结构
 // 只保留我们需要的字段，使用指针来处理可能缺失的值
 type LiteLLMModelPricing struct {
 	InputCostPerToken                   float64 `json:"input_cost_per_token"`
+	InputCostPerTokenPriority           float64 `json:"input_cost_per_token_priority"`
 	OutputCostPerToken                  float64 `json:"output_cost_per_token"`
+	OutputCostPerTokenPriority          float64 `json:"output_cost_per_token_priority"`
 	CacheCreationInputTokenCost         float64 `json:"cache_creation_input_token_cost"`
 	CacheCreationInputTokenCostAbove1hr float64 `json:"cache_creation_input_token_cost_above_1hr"`
 	CacheReadInputTokenCost             float64 `json:"cache_read_input_token_cost"`
+	CacheReadInputTokenCostPriority     float64 `json:"cache_read_input_token_cost_priority"`
+	LongContextInputTokenThreshold      int     `json:"long_context_input_token_threshold,omitempty"`
+	LongContextInputCostMultiplier      float64 `json:"long_context_input_cost_multiplier,omitempty"`
+	LongContextOutputCostMultiplier     float64 `json:"long_context_output_cost_multiplier,omitempty"`
+	SupportsServiceTier                 bool    `json:"supports_service_tier"`
 	LiteLLMProvider                     string  `json:"litellm_provider"`
 	Mode                                string  `json:"mode"`
 	SupportsPromptCaching               bool    `json:"supports_prompt_caching"`
-	OutputCostPerImage                  float64 `json:"output_cost_per_image"` // 图片生成模型每张图片价格
+	OutputCostPerImage                  float64 `json:"output_cost_per_image"`       // 图片生成模型每张图片价格
+	OutputCostPerImageToken             float64 `json:"output_cost_per_image_token"` // 图片输出 token 价格
 }
 
 // PricingRemoteClient 远程价格数据获取接口
@@ -48,14 +83,19 @@ type PricingRemoteClient interface {
 // LiteLLMRawEntry 用于解析原始JSON数据
 type LiteLLMRawEntry struct {
 	InputCostPerToken                   *float64 `json:"input_cost_per_token"`
+	InputCostPerTokenPriority           *float64 `json:"input_cost_per_token_priority"`
 	OutputCostPerToken                  *float64 `json:"output_cost_per_token"`
+	OutputCostPerTokenPriority          *float64 `json:"output_cost_per_token_priority"`
 	CacheCreationInputTokenCost         *float64 `json:"cache_creation_input_token_cost"`
 	CacheCreationInputTokenCostAbove1hr *float64 `json:"cache_creation_input_token_cost_above_1hr"`
 	CacheReadInputTokenCost             *float64 `json:"cache_read_input_token_cost"`
+	CacheReadInputTokenCostPriority     *float64 `json:"cache_read_input_token_cost_priority"`
+	SupportsServiceTier                 bool     `json:"supports_service_tier"`
 	LiteLLMProvider                     string   `json:"litellm_provider"`
 	Mode                                string   `json:"mode"`
 	SupportsPromptCaching               bool     `json:"supports_prompt_caching"`
 	OutputCostPerImage                  *float64 `json:"output_cost_per_image"`
+	OutputCostPerImageToken             *float64 `json:"output_cost_per_image_token"`
 }
 
 // PricingService 动态价格服务
@@ -151,10 +191,38 @@ func (s *PricingService) checkAndUpdatePricing() error {
 		return s.downloadPricingData()
 	}
 
-	// 检查文件是否过期
+	// 先加载本地文件（确保服务可用），再检查是否需要更新
+	if err := s.loadPricingData(pricingFile); err != nil {
+		logger.LegacyPrintf("service.pricing", "[Pricing] Failed to load local file, downloading: %v", err)
+		return s.downloadPricingData()
+	}
+
+	// 如果配置了哈希URL，通过远程哈希检查是否有更新
+	if s.cfg.Pricing.HashURL != "" {
+		remoteHash, err := s.fetchRemoteHash()
+		if err != nil {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Failed to fetch remote hash on startup: %v", err)
+			return nil // 已加载本地文件，哈希获取失败不影响启动
+		}
+
+		s.mu.RLock()
+		localHash := s.localHash
+		s.mu.RUnlock()
+
+		if localHash == "" || remoteHash != localHash {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Remote hash differs on startup (local=%s remote=%s), downloading...",
+				localHash[:min(8, len(localHash))], remoteHash[:min(8, len(remoteHash))])
+			if err := s.downloadPricingData(); err != nil {
+				logger.LegacyPrintf("service.pricing", "[Pricing] Download failed, using existing file: %v", err)
+			}
+		}
+		return nil
+	}
+
+	// 没有哈希URL时，基于文件年龄检查
 	info, err := os.Stat(pricingFile)
 	if err != nil {
-		return s.downloadPricingData()
+		return nil // 已加载本地文件
 	}
 
 	fileAge := time.Since(info.ModTime())
@@ -167,21 +235,11 @@ func (s *PricingService) checkAndUpdatePricing() error {
 		}
 	}
 
-	// 加载本地文件
-	return s.loadPricingData(pricingFile)
+	return nil
 }
 
 // syncWithRemote 与远程同步（基于哈希校验）
 func (s *PricingService) syncWithRemote() error {
-	pricingFile := s.getPricingFilePath()
-
-	// 计算本地文件哈希
-	localHash, err := s.computeFileHash(pricingFile)
-	if err != nil {
-		logger.LegacyPrintf("service.pricing", "[Pricing] Failed to compute local hash: %v", err)
-		return s.downloadPricingData()
-	}
-
 	// 如果配置了哈希URL，从远程获取哈希进行比对
 	if s.cfg.Pricing.HashURL != "" {
 		remoteHash, err := s.fetchRemoteHash()
@@ -190,8 +248,13 @@ func (s *PricingService) syncWithRemote() error {
 			return nil // 哈希获取失败不影响正常使用
 		}
 
-		if remoteHash != localHash {
-			logger.LegacyPrintf("service.pricing", "%s", "[Pricing] Remote hash differs, downloading new version...")
+		s.mu.RLock()
+		localHash := s.localHash
+		s.mu.RUnlock()
+
+		if localHash == "" || remoteHash != localHash {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Remote hash differs (local=%s remote=%s), downloading new version...",
+				localHash[:min(8, len(localHash))], remoteHash[:min(8, len(remoteHash))])
 			return s.downloadPricingData()
 		}
 		logger.LegacyPrintf("service.pricing", "%s", "[Pricing] Hash check passed, no update needed")
@@ -199,6 +262,7 @@ func (s *PricingService) syncWithRemote() error {
 	}
 
 	// 没有哈希URL时，基于时间检查
+	pricingFile := s.getPricingFilePath()
 	info, err := os.Stat(pricingFile)
 	if err != nil {
 		return s.downloadPricingData()
@@ -226,11 +290,12 @@ func (s *PricingService) downloadPricingData() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	var expectedHash string
+	// 获取远程哈希（用于同步锚点，不作为完整性校验）
+	var remoteHash string
 	if strings.TrimSpace(s.cfg.Pricing.HashURL) != "" {
-		expectedHash, err = s.fetchRemoteHash()
+		remoteHash, err = s.fetchRemoteHash()
 		if err != nil {
-			return fmt.Errorf("fetch remote hash: %w", err)
+			logger.LegacyPrintf("service.pricing", "[Pricing] Failed to fetch remote hash (continuing): %v", err)
 		}
 	}
 
@@ -239,11 +304,13 @@ func (s *PricingService) downloadPricingData() error {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
-	if expectedHash != "" {
-		actualHash := sha256.Sum256(body)
-		if !strings.EqualFold(expectedHash, hex.EncodeToString(actualHash[:])) {
-			return fmt.Errorf("pricing hash mismatch")
-		}
+	// 哈希校验：不匹配时仅告警，不阻止更新
+	// 远程哈希文件可能与数据文件不同步（如维护者更新了数据但未更新哈希文件）
+	dataHash := sha256.Sum256(body)
+	dataHashStr := hex.EncodeToString(dataHash[:])
+	if remoteHash != "" && !strings.EqualFold(remoteHash, dataHashStr) {
+		logger.LegacyPrintf("service.pricing", "[Pricing] Hash mismatch warning: remote=%s data=%s (hash file may be out of sync)",
+			remoteHash[:min(8, len(remoteHash))], dataHashStr[:8])
 	}
 
 	// 解析JSON数据（使用灵活的解析方式）
@@ -258,11 +325,14 @@ func (s *PricingService) downloadPricingData() error {
 		logger.LegacyPrintf("service.pricing", "[Pricing] Failed to save file: %v", err)
 	}
 
-	// 保存哈希
-	hash := sha256.Sum256(body)
-	hashStr := hex.EncodeToString(hash[:])
+	// 使用远程哈希作为同步锚点，防止重复下载
+	// 当远程哈希不可用时，回退到数据本身的哈希
+	syncHash := dataHashStr
+	if remoteHash != "" {
+		syncHash = remoteHash
+	}
 	hashFile := s.getHashFilePath()
-	if err := os.WriteFile(hashFile, []byte(hashStr+"\n"), 0644); err != nil {
+	if err := os.WriteFile(hashFile, []byte(syncHash+"\n"), 0644); err != nil {
 		logger.LegacyPrintf("service.pricing", "[Pricing] Failed to save hash: %v", err)
 	}
 
@@ -270,7 +340,7 @@ func (s *PricingService) downloadPricingData() error {
 	s.mu.Lock()
 	s.pricingData = data
 	s.lastUpdated = time.Now()
-	s.localHash = hashStr
+	s.localHash = syncHash
 	s.mu.Unlock()
 
 	logger.LegacyPrintf("service.pricing", "[Pricing] Downloaded %d models successfully", len(data))
@@ -310,13 +380,20 @@ func (s *PricingService) parsePricingData(body []byte) (map[string]*LiteLLMModel
 			LiteLLMProvider:       entry.LiteLLMProvider,
 			Mode:                  entry.Mode,
 			SupportsPromptCaching: entry.SupportsPromptCaching,
+			SupportsServiceTier:   entry.SupportsServiceTier,
 		}
 
 		if entry.InputCostPerToken != nil {
 			pricing.InputCostPerToken = *entry.InputCostPerToken
 		}
+		if entry.InputCostPerTokenPriority != nil {
+			pricing.InputCostPerTokenPriority = *entry.InputCostPerTokenPriority
+		}
 		if entry.OutputCostPerToken != nil {
 			pricing.OutputCostPerToken = *entry.OutputCostPerToken
+		}
+		if entry.OutputCostPerTokenPriority != nil {
+			pricing.OutputCostPerTokenPriority = *entry.OutputCostPerTokenPriority
 		}
 		if entry.CacheCreationInputTokenCost != nil {
 			pricing.CacheCreationInputTokenCost = *entry.CacheCreationInputTokenCost
@@ -327,8 +404,14 @@ func (s *PricingService) parsePricingData(body []byte) (map[string]*LiteLLMModel
 		if entry.CacheReadInputTokenCost != nil {
 			pricing.CacheReadInputTokenCost = *entry.CacheReadInputTokenCost
 		}
+		if entry.CacheReadInputTokenCostPriority != nil {
+			pricing.CacheReadInputTokenCostPriority = *entry.CacheReadInputTokenCostPriority
+		}
 		if entry.OutputCostPerImage != nil {
 			pricing.OutputCostPerImage = *entry.OutputCostPerImage
+		}
+		if entry.OutputCostPerImageToken != nil {
+			pricing.OutputCostPerImageToken = *entry.OutputCostPerImageToken
 		}
 
 		result[modelName] = pricing
@@ -436,16 +519,6 @@ func (s *PricingService) validatePricingURL(raw string) (string, error) {
 		return "", fmt.Errorf("invalid pricing url: %w", err)
 	}
 	return normalized, nil
-}
-
-// computeFileHash 计算文件哈希
-func (s *PricingService) computeFileHash(filePath string) (string, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:]), nil
 }
 
 // GetModelPricing 获取模型价格（带模糊匹配）
@@ -660,7 +733,8 @@ func (s *PricingService) matchByModelFamily(model string) *LiteLLMModelPricing {
 // 2. gpt-5.2-codex -> gpt-5.2（去掉后缀如 -codex, -mini, -max 等）
 // 3. gpt-5.2-20251222 -> gpt-5.2（去掉日期版本号）
 // 4. gpt-5.3-codex -> gpt-5.2-codex
-// 5. 最终回退到 DefaultTestModel (gpt-5.1-codex)
+// 5. gpt-5.4* -> 业务静态兜底价
+// 6. 最终回退到 DefaultTestModel (gpt-5.1-codex)
 func (s *PricingService) matchOpenAIModel(model string) *LiteLLMModelPricing {
 	if strings.HasPrefix(model, "gpt-5.3-codex-spark") {
 		if pricing, ok := s.pricingData["gpt-5.1-codex"]; ok {
@@ -688,6 +762,24 @@ func (s *PricingService) matchOpenAIModel(model string) *LiteLLMModelPricing {
 				Info(fmt.Sprintf("[Pricing] OpenAI fallback matched %s -> %s", model, "gpt-5.2-codex"))
 			return pricing
 		}
+	}
+
+	if strings.HasPrefix(model, "gpt-5.4-mini") {
+		logger.With(zap.String("component", "service.pricing")).
+			Info(fmt.Sprintf("[Pricing] OpenAI fallback matched %s -> %s", model, "gpt-5.4-mini(static)"))
+		return openAIGPT54MiniFallbackPricing
+	}
+
+	if strings.HasPrefix(model, "gpt-5.4-nano") {
+		logger.With(zap.String("component", "service.pricing")).
+			Info(fmt.Sprintf("[Pricing] OpenAI fallback matched %s -> %s", model, "gpt-5.4-nano(static)"))
+		return openAIGPT54NanoFallbackPricing
+	}
+
+	if strings.HasPrefix(model, "gpt-5.4") {
+		logger.With(zap.String("component", "service.pricing")).
+			Info(fmt.Sprintf("[Pricing] OpenAI fallback matched %s -> %s", model, "gpt-5.4(static)"))
+		return openAIGPT54FallbackPricing
 	}
 
 	// 最终回退到 DefaultTestModel

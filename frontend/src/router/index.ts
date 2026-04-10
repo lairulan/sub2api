@@ -84,6 +84,15 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/auth/oidc/callback',
+    name: 'OIDCOAuthCallback',
+    component: () => import('@/views/auth/OidcCallbackView.vue'),
+    meta: {
+      requiresAuth: false,
+      title: 'OIDC OAuth Callback'
+    }
+  },
+  {
     path: '/forgot-password',
     name: 'ForgotPassword',
     component: () => import('@/views/auth/ForgotPasswordView.vue'),
@@ -202,18 +211,6 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
-    path: '/sora',
-    name: 'Sora',
-    component: () => import('@/views/user/SoraView.vue'),
-    meta: {
-      requiresAuth: true,
-      requiresAdmin: false,
-      title: 'Sora',
-      titleKey: 'sora.title',
-      descriptionKey: 'sora.description'
-    }
-  },
-  {
     path: '/custom/:id',
     name: 'CustomPage',
     component: () => import('@/views/user/CustomPageView.vue'),
@@ -276,6 +273,18 @@ const routes: RouteRecordRaw[] = [
       title: 'Group Management',
       titleKey: 'admin.groups.title',
       descriptionKey: 'admin.groups.description'
+    }
+  },
+  {
+    path: '/admin/channels',
+    name: 'AdminChannels',
+    component: () => import('@/views/admin/ChannelsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Channel Management',
+      titleKey: 'admin.channels.title',
+      descriptionKey: 'admin.channels.description'
     }
   },
   {
@@ -351,18 +360,6 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
-    path: '/admin/data-management',
-    name: 'AdminDataManagement',
-    component: () => import('@/views/admin/DataManagementView.vue'),
-    meta: {
-      requiresAuth: true,
-      requiresAdmin: true,
-      title: 'Data Management',
-      titleKey: 'admin.dataManagement.title',
-      descriptionKey: 'admin.dataManagement.description'
-    }
-  },
-  {
     path: '/admin/settings',
     name: 'AdminSettings',
     component: () => import('@/views/admin/SettingsView.vue'),
@@ -423,6 +420,7 @@ let authInitialized = false
 const navigationLoading = useNavigationLoadingState()
 // 延迟初始化预加载，传入 router 实例
 let routePrefetch: ReturnType<typeof useRoutePrefetch> | null = null
+const BACKEND_MODE_ALLOWED_PATHS = ['/login', '/key-usage', '/setup']
 
 router.beforeEach((to, _from, next) => {
   // 开始导航加载状态
@@ -463,9 +461,23 @@ router.beforeEach((to, _from, next) => {
   if (!requiresAuth) {
     // If already authenticated and trying to access login/register, redirect to appropriate dashboard
     if (authStore.isAuthenticated && (to.path === '/login' || to.path === '/register')) {
+      // In backend mode, non-admin users should NOT be redirected away from login
+      // (they are blocked from all protected routes, so redirecting would cause a loop)
+      if (appStore.backendModeEnabled && !authStore.isAdmin) {
+        next()
+        return
+      }
       // Admin users go to admin dashboard, regular users go to user dashboard
       next(authStore.isAdmin ? '/admin/dashboard' : '/dashboard')
       return
+    }
+    // Backend mode: block public pages for unauthenticated users (except login, key-usage, setup)
+    if (appStore.backendModeEnabled && !authStore.isAuthenticated) {
+      const isAllowed = BACKEND_MODE_ALLOWED_PATHS.some((p) => to.path === p || to.path.startsWith(p))
+      if (!isAllowed) {
+        next('/login')
+        return
+      }
     }
     next()
     return
@@ -501,6 +513,19 @@ router.beforeEach((to, _from, next) => {
     if (restrictedPaths.some((path) => to.path.startsWith(path))) {
       // 简易模式下访问受限页面,重定向到仪表板
       next(authStore.isAdmin ? '/admin/dashboard' : '/dashboard')
+      return
+    }
+  }
+
+  // Backend mode: admin gets full access, non-admin blocked
+  if (appStore.backendModeEnabled) {
+    if (authStore.isAuthenticated && authStore.isAdmin) {
+      next()
+      return
+    }
+    const isAllowed = BACKEND_MODE_ALLOWED_PATHS.some((p) => to.path === p || to.path.startsWith(p))
+    if (!isAllowed) {
+      next('/login')
       return
     }
   }

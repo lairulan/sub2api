@@ -151,6 +151,31 @@ func (s *APIKeyRepoSuite) TestDelete() {
 	s.Require().Error(err, "expected error after delete")
 }
 
+func (s *APIKeyRepoSuite) TestCreate_AfterSoftDelete_AllowsSameKey() {
+	user := s.mustCreateUser("recreate-after-soft-delete@test.com")
+	const reusedKey = "sk-reuse-after-soft-delete"
+
+	first := &service.APIKey{
+		UserID: user.ID,
+		Key:    reusedKey,
+		Name:   "First Key",
+		Status: service.StatusActive,
+	}
+	s.Require().NoError(s.repo.Create(s.ctx, first), "create first key")
+
+	s.Require().NoError(s.repo.Delete(s.ctx, first.ID), "soft delete first key")
+
+	second := &service.APIKey{
+		UserID: user.ID,
+		Key:    reusedKey,
+		Name:   "Second Key",
+		Status: service.StatusActive,
+	}
+	s.Require().NoError(s.repo.Create(s.ctx, second), "create second key with same key")
+	s.Require().NotZero(second.ID)
+	s.Require().NotEqual(first.ID, second.ID, "recreated key should be a new row")
+}
+
 // --- ListByUserID / CountByUserID ---
 
 func (s *APIKeyRepoSuite) TestListByUserID() {
@@ -415,6 +440,27 @@ func (s *APIKeyRepoSuite) TestIncrementQuotaUsed_DeletedKey() {
 
 	_, err := s.repo.IncrementQuotaUsed(s.ctx, key.ID, 1.0)
 	s.Require().ErrorIs(err, service.ErrAPIKeyNotFound, "已删除的 key 应返回 ErrAPIKeyNotFound")
+}
+
+func (s *APIKeyRepoSuite) TestIncrementQuotaUsedAndGetState() {
+	user := s.mustCreateUser("quota-state@test.com")
+	key := s.mustCreateApiKey(user.ID, "sk-quota-state", "QuotaState", nil)
+	key.Quota = 3
+	key.QuotaUsed = 1
+	s.Require().NoError(s.repo.Update(s.ctx, key), "Update quota")
+
+	state, err := s.repo.IncrementQuotaUsedAndGetState(s.ctx, key.ID, 2.5)
+	s.Require().NoError(err, "IncrementQuotaUsedAndGetState")
+	s.Require().NotNil(state)
+	s.Require().Equal(3.5, state.QuotaUsed)
+	s.Require().Equal(3.0, state.Quota)
+	s.Require().Equal(service.StatusAPIKeyQuotaExhausted, state.Status)
+	s.Require().Equal(key.Key, state.Key)
+
+	got, err := s.repo.GetByID(s.ctx, key.ID)
+	s.Require().NoError(err, "GetByID")
+	s.Require().Equal(3.5, got.QuotaUsed)
+	s.Require().Equal(service.StatusAPIKeyQuotaExhausted, got.Status)
 }
 
 // TestIncrementQuotaUsed_Concurrent 使用真实数据库验证并发原子性。

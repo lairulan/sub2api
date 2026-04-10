@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/httpclient"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
-	"github.com/Wei-Shaw/sub2api/internal/util/soraerror"
+	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
 )
 
 // AdminService interface defines admin management operations
@@ -42,13 +43,19 @@ type AdminService interface {
 	UpdateGroup(ctx context.Context, id int64, input *UpdateGroupInput) (*Group, error)
 	DeleteGroup(ctx context.Context, id int64) error
 	GetGroupAPIKeys(ctx context.Context, groupID int64, page, pageSize int) ([]APIKey, int64, error)
+	GetGroupRateMultipliers(ctx context.Context, groupID int64) ([]UserGroupRateEntry, error)
+	ClearGroupRateMultipliers(ctx context.Context, groupID int64) error
+	BatchSetGroupRateMultipliers(ctx context.Context, groupID int64, entries []GroupRateMultiplierInput) error
 	UpdateGroupSortOrders(ctx context.Context, updates []GroupSortOrderUpdate) error
 
 	// API Key management (admin)
 	AdminUpdateAPIKeyGroupID(ctx context.Context, keyID int64, groupID *int64) (*AdminUpdateAPIKeyGroupIDResult, error)
 
+	// ReplaceUserGroup 替换用户的专属分组：授予新分组权限、迁移 Key、移除旧分组权限
+	ReplaceUserGroup(ctx context.Context, userID, oldGroupID, newGroupID int64) (*ReplaceUserGroupResult, error)
+
 	// Account management
-	ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64) ([]Account, int64, error)
+	ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, int64, error)
 	GetAccount(ctx context.Context, id int64) (*Account, error)
 	GetAccountsByIDs(ctx context.Context, ids []int64) ([]*Account, error)
 	CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error)
@@ -57,6 +64,14 @@ type AdminService interface {
 	RefreshAccountCredentials(ctx context.Context, id int64) (*Account, error)
 	ClearAccountError(ctx context.Context, id int64) (*Account, error)
 	SetAccountError(ctx context.Context, id int64, errorMsg string) error
+	// EnsureOpenAIPrivacy 检查 OpenAI OAuth 账号 privacy_mode，未设置则尝试关闭训练数据共享并持久化。
+	EnsureOpenAIPrivacy(ctx context.Context, account *Account) string
+	// EnsureAntigravityPrivacy 检查 Antigravity OAuth 账号 privacy_mode，未设置则调用 setUserSettings 并持久化。
+	EnsureAntigravityPrivacy(ctx context.Context, account *Account) string
+	// ForceOpenAIPrivacy 强制重新设置 OpenAI OAuth 账号隐私，无论当前状态。
+	ForceOpenAIPrivacy(ctx context.Context, account *Account) string
+	// ForceAntigravityPrivacy 强制重新设置 Antigravity OAuth 账号隐私，无论当前状态。
+	ForceAntigravityPrivacy(ctx context.Context, account *Account) string
 	SetAccountSchedulable(ctx context.Context, id int64, schedulable bool) (*Account, error)
 	BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error)
 	CheckMixedChannelRisk(ctx context.Context, currentAccountID int64, currentAccountPlatform string, groupIDs []int64) error
@@ -84,18 +99,18 @@ type AdminService interface {
 	DeleteRedeemCode(ctx context.Context, id int64) error
 	BatchDeleteRedeemCodes(ctx context.Context, ids []int64) (int64, error)
 	ExpireRedeemCode(ctx context.Context, id int64) (*RedeemCode, error)
+	ResetAccountQuota(ctx context.Context, id int64) error
 }
 
 // CreateUserInput represents input for creating a new user via admin operations.
 type CreateUserInput struct {
-	Email                 string
-	Password              string
-	Username              string
-	Notes                 string
-	Balance               float64
-	Concurrency           int
-	AllowedGroups         []int64
-	SoraStorageQuotaBytes int64
+	Email         string
+	Password      string
+	Username      string
+	Notes         string
+	Balance       float64
+	Concurrency   int
+	AllowedGroups []int64
 }
 
 type UpdateUserInput struct {
@@ -109,8 +124,7 @@ type UpdateUserInput struct {
 	AllowedGroups *[]int64 // 使用指针区分"未提供"和"设置为空数组"
 	// GroupRates 用户专属分组倍率配置
 	// map[groupID]*rate，nil 表示删除该分组的专属倍率
-	GroupRates            map[int64]*float64
-	SoraStorageQuotaBytes *int64
+	GroupRates map[int64]*float64
 }
 
 type CreateGroupInput struct {
@@ -124,16 +138,11 @@ type CreateGroupInput struct {
 	WeeklyLimitUSD   *float64 // 周限额 (USD)
 	MonthlyLimitUSD  *float64 // 月限额 (USD)
 	// 图片生成计费配置（仅 antigravity 平台使用）
-	ImagePrice1K *float64
-	ImagePrice2K *float64
-	ImagePrice4K *float64
-	// Sora 按次计费配置
-	SoraImagePrice360          *float64
-	SoraImagePrice540          *float64
-	SoraVideoPricePerRequest   *float64
-	SoraVideoPricePerRequestHD *float64
-	ClaudeCodeOnly             bool   // 仅允许 Claude Code 客户端
-	FallbackGroupID            *int64 // 降级分组 ID
+	ImagePrice1K    *float64
+	ImagePrice2K    *float64
+	ImagePrice4K    *float64
+	ClaudeCodeOnly  bool   // 仅允许 Claude Code 客户端
+	FallbackGroupID *int64 // 降级分组 ID
 	// 无效请求兜底分组 ID（仅 anthropic 平台使用）
 	FallbackGroupIDOnInvalidRequest *int64
 	// 模型路由配置（仅 anthropic 平台使用）
@@ -142,8 +151,12 @@ type CreateGroupInput struct {
 	MCPXMLInject        *bool
 	// 支持的模型系列（仅 antigravity 平台使用）
 	SupportedModelScopes []string
-	// Sora 存储配额
-	SoraStorageQuotaBytes int64
+	// OpenAI Messages 调度配置（仅 openai 平台使用）
+	AllowMessagesDispatch       bool
+	DefaultMappedModel          string
+	RequireOAuthOnly            bool
+	RequirePrivacySet           bool
+	MessagesDispatchModelConfig OpenAIMessagesDispatchModelConfig
 	// 从指定分组复制账号（创建分组后在同一事务内绑定）
 	CopyAccountsFromGroupIDs []int64
 }
@@ -160,16 +173,11 @@ type UpdateGroupInput struct {
 	WeeklyLimitUSD   *float64 // 周限额 (USD)
 	MonthlyLimitUSD  *float64 // 月限额 (USD)
 	// 图片生成计费配置（仅 antigravity 平台使用）
-	ImagePrice1K *float64
-	ImagePrice2K *float64
-	ImagePrice4K *float64
-	// Sora 按次计费配置
-	SoraImagePrice360          *float64
-	SoraImagePrice540          *float64
-	SoraVideoPricePerRequest   *float64
-	SoraVideoPricePerRequestHD *float64
-	ClaudeCodeOnly             *bool  // 仅允许 Claude Code 客户端
-	FallbackGroupID            *int64 // 降级分组 ID
+	ImagePrice1K    *float64
+	ImagePrice2K    *float64
+	ImagePrice4K    *float64
+	ClaudeCodeOnly  *bool  // 仅允许 Claude Code 客户端
+	FallbackGroupID *int64 // 降级分组 ID
 	// 无效请求兜底分组 ID（仅 anthropic 平台使用）
 	FallbackGroupIDOnInvalidRequest *int64
 	// 模型路由配置（仅 anthropic 平台使用）
@@ -178,8 +186,12 @@ type UpdateGroupInput struct {
 	MCPXMLInject        *bool
 	// 支持的模型系列（仅 antigravity 平台使用）
 	SupportedModelScopes *[]string
-	// Sora 存储配额
-	SoraStorageQuotaBytes *int64
+	// OpenAI Messages 调度配置（仅 openai 平台使用）
+	AllowMessagesDispatch       *bool
+	DefaultMappedModel          *string
+	RequireOAuthOnly            *bool
+	RequirePrivacySet           *bool
+	MessagesDispatchModelConfig *OpenAIMessagesDispatchModelConfig
 	// 从指定分组复制账号（同步操作：先清空当前分组的账号绑定，再绑定源分组的账号）
 	CopyAccountsFromGroupIDs []int64
 }
@@ -195,6 +207,7 @@ type CreateAccountInput struct {
 	Concurrency        int
 	Priority           int
 	RateMultiplier     *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor         *int
 	GroupIDs           []int64
 	ExpiresAt          *int64
 	AutoPauseOnExpired *bool
@@ -215,6 +228,7 @@ type UpdateAccountInput struct {
 	Concurrency           *int     // 使用指针区分"未提供"和"设置为0"
 	Priority              *int     // 使用指针区分"未提供"和"设置为0"
 	RateMultiplier        *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor            *int
 	Status                string
 	GroupIDs              *[]int64
 	ExpiresAt             *int64
@@ -230,6 +244,7 @@ type BulkUpdateAccountsInput struct {
 	Concurrency    *int
 	Priority       *int
 	RateMultiplier *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor     *int
 	Status         string
 	Schedulable    *bool
 	GroupIDs       *[]int64
@@ -253,6 +268,11 @@ type AdminUpdateAPIKeyGroupIDResult struct {
 	AutoGrantedGroupAccess bool   // true if a new exclusive group permission was auto-added
 	GrantedGroupID         *int64 // the group ID that was auto-granted
 	GrantedGroupName       string // the group name that was auto-granted
+}
+
+// ReplaceUserGroupResult 分组替换操作的结果
+type ReplaceUserGroupResult struct {
+	MigratedKeys int64 // 迁移的 Key 数量
 }
 
 // BulkUpdateAccountsResult is the aggregated response for bulk updates.
@@ -353,6 +373,10 @@ type ProxyExitInfoProber interface {
 	ProbeProxy(ctx context.Context, proxyURL string) (*ProxyExitInfo, int64, error)
 }
 
+type groupExistenceBatchReader interface {
+	ExistsByIDs(ctx context.Context, ids []int64) (map[int64]bool, error)
+}
+
 type proxyQualityTarget struct {
 	Target          string
 	URL             string
@@ -388,14 +412,6 @@ var proxyQualityTargets = []proxyQualityTarget{
 			http.StatusOK: {},
 		},
 	},
-	{
-		Target: "sora",
-		URL:    "https://sora.chatgpt.com/backend/me",
-		Method: http.MethodGet,
-		AllowedStatuses: map[int]struct{}{
-			http.StatusUnauthorized: {},
-		},
-	},
 }
 
 const (
@@ -410,7 +426,6 @@ type adminServiceImpl struct {
 	userRepo             UserRepository
 	groupRepo            GroupRepository
 	accountRepo          AccountRepository
-	soraAccountRepo      SoraAccountRepository // Sora 账号扩展表仓储
 	proxyRepo            ProxyRepository
 	apiKeyRepo           APIKeyRepository
 	redeemCodeRepo       RedeemCodeRepository
@@ -422,14 +437,12 @@ type adminServiceImpl struct {
 	entClient            *dbent.Client // 用于开启数据库事务
 	settingService       *SettingService
 	defaultSubAssigner   DefaultSubscriptionAssigner
+	userSubRepo          UserSubscriptionRepository
+	privacyClientFactory PrivacyClientFactory
 }
 
 type userGroupRateBatchReader interface {
 	GetByUserIDs(ctx context.Context, userIDs []int64) (map[int64]map[int64]float64, error)
-}
-
-type groupExistenceBatchReader interface {
-	ExistsByIDs(ctx context.Context, ids []int64) (map[int64]bool, error)
 }
 
 // NewAdminService creates a new AdminService
@@ -437,7 +450,6 @@ func NewAdminService(
 	userRepo UserRepository,
 	groupRepo GroupRepository,
 	accountRepo AccountRepository,
-	soraAccountRepo SoraAccountRepository,
 	proxyRepo ProxyRepository,
 	apiKeyRepo APIKeyRepository,
 	redeemCodeRepo RedeemCodeRepository,
@@ -449,12 +461,13 @@ func NewAdminService(
 	entClient *dbent.Client,
 	settingService *SettingService,
 	defaultSubAssigner DefaultSubscriptionAssigner,
+	userSubRepo UserSubscriptionRepository,
+	privacyClientFactory PrivacyClientFactory,
 ) AdminService {
 	return &adminServiceImpl{
 		userRepo:             userRepo,
 		groupRepo:            groupRepo,
 		accountRepo:          accountRepo,
-		soraAccountRepo:      soraAccountRepo,
 		proxyRepo:            proxyRepo,
 		apiKeyRepo:           apiKeyRepo,
 		redeemCodeRepo:       redeemCodeRepo,
@@ -466,6 +479,8 @@ func NewAdminService(
 		entClient:            entClient,
 		settingService:       settingService,
 		defaultSubAssigner:   defaultSubAssigner,
+		userSubRepo:          userSubRepo,
+		privacyClientFactory: privacyClientFactory,
 	}
 }
 
@@ -534,15 +549,14 @@ func (s *adminServiceImpl) GetUser(ctx context.Context, id int64) (*User, error)
 
 func (s *adminServiceImpl) CreateUser(ctx context.Context, input *CreateUserInput) (*User, error) {
 	user := &User{
-		Email:                 input.Email,
-		Username:              input.Username,
-		Notes:                 input.Notes,
-		Role:                  RoleUser, // Always create as regular user, never admin
-		Balance:               input.Balance,
-		Concurrency:           input.Concurrency,
-		Status:                StatusActive,
-		AllowedGroups:         input.AllowedGroups,
-		SoraStorageQuotaBytes: input.SoraStorageQuotaBytes,
+		Email:         input.Email,
+		Username:      input.Username,
+		Notes:         input.Notes,
+		Role:          RoleUser, // Always create as regular user, never admin
+		Balance:       input.Balance,
+		Concurrency:   input.Concurrency,
+		Status:        StatusActive,
+		AllowedGroups: input.AllowedGroups,
 	}
 	if err := user.SetPassword(input.Password); err != nil {
 		return nil, err
@@ -612,10 +626,6 @@ func (s *adminServiceImpl) UpdateUser(ctx context.Context, id int64, input *Upda
 
 	if input.AllowedGroups != nil {
 		user.AllowedGroups = *input.AllowedGroups
-	}
-
-	if input.SoraStorageQuotaBytes != nil {
-		user.SoraStorageQuotaBytes = *input.SoraStorageQuotaBytes
 	}
 
 	if err := s.userRepo.Update(ctx, user); err != nil {
@@ -811,7 +821,7 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		subscriptionType = SubscriptionTypeStandard
 	}
 
-	// 限额字段：0 和 nil 都表示"无限制"
+	// 限额字段：nil/负数 表示"无限制"，0 表示"不允许用量"，正数表示具体限额
 	dailyLimit := normalizeLimit(input.DailyLimitUSD)
 	weeklyLimit := normalizeLimit(input.WeeklyLimitUSD)
 	monthlyLimit := normalizeLimit(input.MonthlyLimitUSD)
@@ -820,10 +830,6 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	imagePrice1K := normalizePrice(input.ImagePrice1K)
 	imagePrice2K := normalizePrice(input.ImagePrice2K)
 	imagePrice4K := normalizePrice(input.ImagePrice4K)
-	soraImagePrice360 := normalizePrice(input.SoraImagePrice360)
-	soraImagePrice540 := normalizePrice(input.SoraImagePrice540)
-	soraVideoPrice := normalizePrice(input.SoraVideoPricePerRequest)
-	soraVideoPriceHD := normalizePrice(input.SoraVideoPricePerRequestHD)
 
 	// 校验降级分组
 	if input.FallbackGroupID != nil {
@@ -894,20 +900,42 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		ImagePrice1K:                    imagePrice1K,
 		ImagePrice2K:                    imagePrice2K,
 		ImagePrice4K:                    imagePrice4K,
-		SoraImagePrice360:               soraImagePrice360,
-		SoraImagePrice540:               soraImagePrice540,
-		SoraVideoPricePerRequest:        soraVideoPrice,
-		SoraVideoPricePerRequestHD:      soraVideoPriceHD,
 		ClaudeCodeOnly:                  input.ClaudeCodeOnly,
 		FallbackGroupID:                 input.FallbackGroupID,
 		FallbackGroupIDOnInvalidRequest: fallbackOnInvalidRequest,
 		ModelRouting:                    input.ModelRouting,
 		MCPXMLInject:                    mcpXMLInject,
 		SupportedModelScopes:            input.SupportedModelScopes,
-		SoraStorageQuotaBytes:           input.SoraStorageQuotaBytes,
+		AllowMessagesDispatch:           input.AllowMessagesDispatch,
+		RequireOAuthOnly:                input.RequireOAuthOnly,
+		RequirePrivacySet:               input.RequirePrivacySet,
+		DefaultMappedModel:              input.DefaultMappedModel,
+		MessagesDispatchModelConfig:     normalizeOpenAIMessagesDispatchModelConfig(input.MessagesDispatchModelConfig),
 	}
+	sanitizeGroupMessagesDispatchFields(group)
 	if err := s.groupRepo.Create(ctx, group); err != nil {
 		return nil, err
+	}
+
+	// require_oauth_only: 过滤掉 apikey 类型账号
+	if group.RequireOAuthOnly && (group.Platform == PlatformOpenAI || group.Platform == PlatformAntigravity || group.Platform == PlatformAnthropic || group.Platform == PlatformGemini) && len(accountIDsToCopy) > 0 {
+		accounts, err := s.accountRepo.GetByIDs(ctx, accountIDsToCopy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch accounts for oauth filter: %w", err)
+		}
+		oauthIDs := make(map[int64]struct{}, len(accounts))
+		for _, acc := range accounts {
+			if acc.Type != AccountTypeAPIKey {
+				oauthIDs[acc.ID] = struct{}{}
+			}
+		}
+		var filtered []int64
+		for _, aid := range accountIDsToCopy {
+			if _, ok := oauthIDs[aid]; ok {
+				filtered = append(filtered, aid)
+			}
+		}
+		accountIDsToCopy = filtered
 	}
 
 	// 如果有需要复制的账号，绑定到新分组
@@ -921,9 +949,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	return group, nil
 }
 
-// normalizeLimit 将 0 或负数转换为 nil（表示无限制）
+// normalizeLimit 将负数转换为 nil（表示无限制），0 保留（表示限额为零）
 func normalizeLimit(limit *float64) *float64 {
-	if limit == nil || *limit <= 0 {
+	if limit == nil || *limit < 0 {
 		return nil
 	}
 	return limit
@@ -1035,16 +1063,11 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	if input.SubscriptionType != "" {
 		group.SubscriptionType = input.SubscriptionType
 	}
-	// 限额字段：0 和 nil 都表示"无限制"，正数表示具体限额
-	if input.DailyLimitUSD != nil {
-		group.DailyLimitUSD = normalizeLimit(input.DailyLimitUSD)
-	}
-	if input.WeeklyLimitUSD != nil {
-		group.WeeklyLimitUSD = normalizeLimit(input.WeeklyLimitUSD)
-	}
-	if input.MonthlyLimitUSD != nil {
-		group.MonthlyLimitUSD = normalizeLimit(input.MonthlyLimitUSD)
-	}
+	// 限额字段：nil/负数 表示"无限制"，0 表示"不允许用量"，正数表示具体限额
+	// 前端始终发送这三个字段，无需 nil 守卫
+	group.DailyLimitUSD = normalizeLimit(input.DailyLimitUSD)
+	group.WeeklyLimitUSD = normalizeLimit(input.WeeklyLimitUSD)
+	group.MonthlyLimitUSD = normalizeLimit(input.MonthlyLimitUSD)
 	// 图片生成计费配置：负数表示清除（使用默认价格）
 	if input.ImagePrice1K != nil {
 		group.ImagePrice1K = normalizePrice(input.ImagePrice1K)
@@ -1054,21 +1077,6 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	}
 	if input.ImagePrice4K != nil {
 		group.ImagePrice4K = normalizePrice(input.ImagePrice4K)
-	}
-	if input.SoraImagePrice360 != nil {
-		group.SoraImagePrice360 = normalizePrice(input.SoraImagePrice360)
-	}
-	if input.SoraImagePrice540 != nil {
-		group.SoraImagePrice540 = normalizePrice(input.SoraImagePrice540)
-	}
-	if input.SoraVideoPricePerRequest != nil {
-		group.SoraVideoPricePerRequest = normalizePrice(input.SoraVideoPricePerRequest)
-	}
-	if input.SoraVideoPricePerRequestHD != nil {
-		group.SoraVideoPricePerRequestHD = normalizePrice(input.SoraVideoPricePerRequestHD)
-	}
-	if input.SoraStorageQuotaBytes != nil {
-		group.SoraStorageQuotaBytes = *input.SoraStorageQuotaBytes
 	}
 
 	// Claude Code 客户端限制
@@ -1118,6 +1126,24 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		group.SupportedModelScopes = *input.SupportedModelScopes
 	}
 
+	// OpenAI Messages 调度配置
+	if input.AllowMessagesDispatch != nil {
+		group.AllowMessagesDispatch = *input.AllowMessagesDispatch
+	}
+	if input.RequireOAuthOnly != nil {
+		group.RequireOAuthOnly = *input.RequireOAuthOnly
+	}
+	if input.RequirePrivacySet != nil {
+		group.RequirePrivacySet = *input.RequirePrivacySet
+	}
+	if input.DefaultMappedModel != nil {
+		group.DefaultMappedModel = *input.DefaultMappedModel
+	}
+	if input.MessagesDispatchModelConfig != nil {
+		group.MessagesDispatchModelConfig = normalizeOpenAIMessagesDispatchModelConfig(*input.MessagesDispatchModelConfig)
+	}
+	sanitizeGroupMessagesDispatchFields(group)
+
 	if err := s.groupRepo.Update(ctx, group); err != nil {
 		return nil, err
 	}
@@ -1159,6 +1185,27 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		// 先清空当前分组的所有账号绑定
 		if _, err := s.groupRepo.DeleteAccountGroupsByGroupID(ctx, id); err != nil {
 			return nil, fmt.Errorf("failed to clear existing account bindings: %w", err)
+		}
+
+		// require_oauth_only: 过滤掉 apikey 类型账号
+		if group.RequireOAuthOnly && (group.Platform == PlatformOpenAI || group.Platform == PlatformAntigravity || group.Platform == PlatformAnthropic || group.Platform == PlatformGemini) && len(accountIDsToCopy) > 0 {
+			accounts, err := s.accountRepo.GetByIDs(ctx, accountIDsToCopy)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch accounts for oauth filter: %w", err)
+			}
+			oauthIDs := make(map[int64]struct{}, len(accounts))
+			for _, acc := range accounts {
+				if acc.Type != AccountTypeAPIKey {
+					oauthIDs[acc.ID] = struct{}{}
+				}
+			}
+			var filtered []int64
+			for _, aid := range accountIDsToCopy {
+				if _, ok := oauthIDs[aid]; ok {
+					filtered = append(filtered, aid)
+				}
+			}
+			accountIDsToCopy = filtered
 		}
 
 		// 再绑定源分组的账号
@@ -1221,6 +1268,27 @@ func (s *adminServiceImpl) GetGroupAPIKeys(ctx context.Context, groupID int64, p
 	return keys, result.Total, nil
 }
 
+func (s *adminServiceImpl) GetGroupRateMultipliers(ctx context.Context, groupID int64) ([]UserGroupRateEntry, error) {
+	if s.userGroupRateRepo == nil {
+		return nil, nil
+	}
+	return s.userGroupRateRepo.GetByGroupID(ctx, groupID)
+}
+
+func (s *adminServiceImpl) ClearGroupRateMultipliers(ctx context.Context, groupID int64) error {
+	if s.userGroupRateRepo == nil {
+		return nil
+	}
+	return s.userGroupRateRepo.DeleteByGroupID(ctx, groupID)
+}
+
+func (s *adminServiceImpl) BatchSetGroupRateMultipliers(ctx context.Context, groupID int64, entries []GroupRateMultiplierInput) error {
+	if s.userGroupRateRepo == nil {
+		return nil
+	}
+	return s.userGroupRateRepo.SyncGroupRateMultipliers(ctx, groupID, entries)
+}
+
 func (s *adminServiceImpl) UpdateGroupSortOrders(ctx context.Context, updates []GroupSortOrderUpdate) error {
 	return s.groupRepo.UpdateSortOrders(ctx, updates)
 }
@@ -1257,9 +1325,17 @@ func (s *adminServiceImpl) AdminUpdateAPIKeyGroupID(ctx context.Context, keyID i
 		if group.Status != StatusActive {
 			return nil, infraerrors.BadRequest("GROUP_NOT_ACTIVE", "target group is not active")
 		}
-		// 订阅类型分组：不允许通过此 API 直接绑定，需通过订阅管理流程
+		// 订阅类型分组：用户须持有该分组的有效订阅才可绑定
 		if group.IsSubscriptionType() {
-			return nil, infraerrors.BadRequest("SUBSCRIPTION_GROUP_NOT_ALLOWED", "subscription groups must be managed through the subscription workflow")
+			if s.userSubRepo == nil {
+				return nil, infraerrors.InternalServer("SUBSCRIPTION_REPOSITORY_UNAVAILABLE", "subscription repository is not configured")
+			}
+			if _, err := s.userSubRepo.GetActiveByUserIDAndGroupID(ctx, apiKey.UserID, *groupID); err != nil {
+				if errors.Is(err, ErrSubscriptionNotFound) {
+					return nil, infraerrors.BadRequest("SUBSCRIPTION_REQUIRED", "user does not have an active subscription for this group")
+				}
+				return nil, err
+			}
 		}
 
 		gid := *groupID
@@ -1267,7 +1343,7 @@ func (s *adminServiceImpl) AdminUpdateAPIKeyGroupID(ctx context.Context, keyID i
 		apiKey.Group = group
 
 		// 专属标准分组：使用事务保证「添加分组权限」与「更新 API Key」的原子性
-		if group.IsExclusive {
+		if group.IsExclusive && !group.IsSubscriptionType() {
 			opCtx := ctx
 			var tx *dbent.Tx
 			if s.entClient == nil {
@@ -1322,12 +1398,81 @@ func (s *adminServiceImpl) AdminUpdateAPIKeyGroupID(ctx context.Context, keyID i
 	return result, nil
 }
 
+// ReplaceUserGroup 替换用户的专属分组
+func (s *adminServiceImpl) ReplaceUserGroup(ctx context.Context, userID, oldGroupID, newGroupID int64) (*ReplaceUserGroupResult, error) {
+	if oldGroupID == newGroupID {
+		return nil, infraerrors.BadRequest("SAME_GROUP", "old and new group must be different")
+	}
+
+	// 验证新分组存在且为活跃的专属标准分组
+	newGroup, err := s.groupRepo.GetByID(ctx, newGroupID)
+	if err != nil {
+		return nil, err
+	}
+	if newGroup.Status != StatusActive {
+		return nil, infraerrors.BadRequest("GROUP_NOT_ACTIVE", "target group is not active")
+	}
+	if !newGroup.IsExclusive {
+		return nil, infraerrors.BadRequest("GROUP_NOT_EXCLUSIVE", "target group is not exclusive")
+	}
+	if newGroup.IsSubscriptionType() {
+		return nil, infraerrors.BadRequest("GROUP_IS_SUBSCRIPTION", "subscription groups are not supported for replacement")
+	}
+
+	// 事务保证原子性
+	if s.entClient == nil {
+		return nil, fmt.Errorf("entClient is nil, cannot perform group replacement")
+	}
+	tx, err := s.entClient.Tx(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	opCtx := dbent.NewTxContext(ctx, tx)
+
+	// 1. 授予新分组权限
+	if err := s.userRepo.AddGroupToAllowedGroups(opCtx, userID, newGroupID); err != nil {
+		return nil, fmt.Errorf("add new group to allowed groups: %w", err)
+	}
+
+	// 2. 迁移绑定旧分组的 Key 到新分组
+	migrated, err := s.apiKeyRepo.UpdateGroupIDByUserAndGroup(opCtx, userID, oldGroupID, newGroupID)
+	if err != nil {
+		return nil, fmt.Errorf("migrate api keys: %w", err)
+	}
+
+	// 3. 移除旧分组权限
+	if err := s.userRepo.RemoveGroupFromUserAllowedGroups(opCtx, userID, oldGroupID); err != nil {
+		return nil, fmt.Errorf("remove old group from allowed groups: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	// 失效该用户所有 Key 的认证缓存
+	if s.authCacheInvalidator != nil {
+		keys, keyErr := s.apiKeyRepo.ListKeysByUserID(ctx, userID)
+		if keyErr == nil {
+			for _, k := range keys {
+				s.authCacheInvalidator.InvalidateAuthCacheByKey(ctx, k)
+			}
+		}
+	}
+
+	return &ReplaceUserGroupResult{MigratedKeys: migrated}, nil
+}
+
 // Account management implementations
-func (s *adminServiceImpl) ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64) ([]Account, int64, error) {
+func (s *adminServiceImpl) ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize}
-	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID)
+	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID, privacyMode)
 	if err != nil {
 		return nil, 0, err
+	}
+	now := time.Now()
+	for i := range accounts {
+		syncOpenAICodexRateLimitFromExtra(ctx, s.accountRepo, &accounts[i], now)
 	}
 	return accounts, result.Total, nil
 }
@@ -1373,18 +1518,6 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		}
 	}
 
-	// Sora apikey 账号的 base_url 必填校验
-	if input.Platform == PlatformSora && input.Type == AccountTypeAPIKey {
-		baseURL, _ := input.Credentials["base_url"].(string)
-		baseURL = strings.TrimSpace(baseURL)
-		if baseURL == "" {
-			return nil, errors.New("sora apikey 账号必须设置 base_url")
-		}
-		if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-			return nil, errors.New("base_url 必须以 http:// 或 https:// 开头")
-		}
-	}
-
 	account := &Account{
 		Name:        input.Name,
 		Notes:       normalizeAccountNotes(input.Notes),
@@ -1397,6 +1530,13 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		Priority:    input.Priority,
 		Status:      StatusActive,
 		Schedulable: true,
+	}
+	// 预计算固定时间重置的下次重置时间
+	if account.Extra != nil {
+		if err := ValidateQuotaResetConfig(account.Extra); err != nil {
+			return nil, err
+		}
+		ComputeQuotaResetAt(account.Extra)
 	}
 	if input.ExpiresAt != nil && *input.ExpiresAt > 0 {
 		expiresAt := time.Unix(*input.ExpiresAt, 0)
@@ -1413,26 +1553,45 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		}
 		account.RateMultiplier = input.RateMultiplier
 	}
+	if input.LoadFactor != nil && *input.LoadFactor > 0 {
+		if *input.LoadFactor > 10000 {
+			return nil, errors.New("load_factor must be <= 10000")
+		}
+		account.LoadFactor = input.LoadFactor
+	}
 	if err := s.accountRepo.Create(ctx, account); err != nil {
 		return nil, err
-	}
-
-	// 如果是 Sora 平台账号，自动创建 sora_accounts 扩展表记录
-	if account.Platform == PlatformSora && s.soraAccountRepo != nil {
-		soraUpdates := map[string]any{
-			"access_token":  account.GetCredential("access_token"),
-			"refresh_token": account.GetCredential("refresh_token"),
-		}
-		if err := s.soraAccountRepo.Upsert(ctx, account.ID, soraUpdates); err != nil {
-			// 只记录警告日志，不阻塞账号创建
-			logger.LegacyPrintf("service.admin", "[AdminService] 创建 sora_accounts 记录失败: account_id=%d err=%v", account.ID, err)
-		}
 	}
 
 	// 绑定分组
 	if len(groupIDs) > 0 {
 		if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
 			return nil, err
+		}
+	}
+
+	// OAuth 账号：创建后异步设置隐私。
+	// 使用 Ensure（幂等）而非 Force：新建账号 Extra 为空时效果相同，但更安全。
+	if account.Type == AccountTypeOAuth {
+		switch account.Platform {
+		case PlatformOpenAI:
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("create_account_openai_privacy_panic", "account_id", account.ID, "recover", r)
+					}
+				}()
+				s.EnsureOpenAIPrivacy(context.Background(), account)
+			}()
+		case PlatformAntigravity:
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("create_account_antigravity_privacy_panic", "account_id", account.ID, "recover", r)
+					}
+				}()
+				s.EnsureAntigravityPrivacy(context.Background(), account)
+			}()
 		}
 	}
 
@@ -1444,6 +1603,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
+	wasOveragesEnabled := account.IsOveragesEnabled()
 
 	if input.Name != "" {
 		account.Name = input.Name
@@ -1457,8 +1617,32 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if len(input.Credentials) > 0 {
 		account.Credentials = input.Credentials
 	}
-	if len(input.Extra) > 0 {
+	// Extra 使用 map：需要区分“未提供(nil)”与“显式清空({})”。
+	// 关闭配额限制时前端会删除 quota_* 键并提交 extra:{}，此时也必须落库。
+	if input.Extra != nil {
+		// 保留配额用量字段，防止编辑账号时意外重置
+		for _, key := range []string{"quota_used", "quota_daily_used", "quota_daily_start", "quota_weekly_used", "quota_weekly_start"} {
+			if v, ok := account.Extra[key]; ok {
+				input.Extra[key] = v
+			}
+		}
 		account.Extra = input.Extra
+		if account.Platform == PlatformAntigravity && wasOveragesEnabled && !account.IsOveragesEnabled() {
+			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
+			// 清除 AICredits 限流 key
+			if rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any); ok {
+				delete(rawLimits, creditsExhaustedKey)
+			}
+		}
+		if account.Platform == PlatformAntigravity && !wasOveragesEnabled && account.IsOveragesEnabled() {
+			delete(account.Extra, modelRateLimitsKey)
+			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
+		}
+		// 校验并预计算固定时间重置的下次重置时间
+		if err := ValidateQuotaResetConfig(account.Extra); err != nil {
+			return nil, err
+		}
+		ComputeQuotaResetAt(account.Extra)
 	}
 	if input.ProxyID != nil {
 		// 0 表示清除代理（前端发送 0 而不是 null 来表达清除意图）
@@ -1483,6 +1667,15 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 		account.RateMultiplier = input.RateMultiplier
 	}
+	if input.LoadFactor != nil {
+		if *input.LoadFactor <= 0 {
+			account.LoadFactor = nil // 0 或负数表示清除
+		} else if *input.LoadFactor > 10000 {
+			return nil, errors.New("load_factor must be <= 10000")
+		} else {
+			account.LoadFactor = input.LoadFactor
+		}
+	}
 	if input.Status != "" {
 		account.Status = input.Status
 	}
@@ -1496,18 +1689,6 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	if input.AutoPauseOnExpired != nil {
 		account.AutoPauseOnExpired = *input.AutoPauseOnExpired
-	}
-
-	// Sora apikey 账号的 base_url 必填校验
-	if account.Platform == PlatformSora && account.Type == AccountTypeAPIKey {
-		baseURL, _ := account.Credentials["base_url"].(string)
-		baseURL = strings.TrimSpace(baseURL)
-		if baseURL == "" {
-			return nil, errors.New("sora apikey 账号必须设置 base_url")
-		}
-		if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-			return nil, errors.New("base_url 必须以 http:// 或 https:// 开头")
-		}
 	}
 
 	// 先验证分组是否存在（在任何写操作之前）
@@ -1616,6 +1797,15 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	if input.RateMultiplier != nil {
 		repoUpdates.RateMultiplier = input.RateMultiplier
 	}
+	if input.LoadFactor != nil {
+		if *input.LoadFactor <= 0 {
+			repoUpdates.LoadFactor = nil // 0 或负数表示清除
+		} else if *input.LoadFactor > 10000 {
+			return nil, errors.New("load_factor must be <= 10000")
+		} else {
+			repoUpdates.LoadFactor = input.LoadFactor
+		}
+	}
 	if input.Status != "" {
 		repoUpdates.Status = &input.Status
 	}
@@ -1669,16 +1859,22 @@ func (s *adminServiceImpl) RefreshAccountCredentials(ctx context.Context, id int
 }
 
 func (s *adminServiceImpl) ClearAccountError(ctx context.Context, id int64) (*Account, error) {
-	account, err := s.accountRepo.GetByID(ctx, id)
-	if err != nil {
+	if err := s.accountRepo.ClearError(ctx, id); err != nil {
 		return nil, err
 	}
-	account.Status = StatusActive
-	account.ErrorMessage = ""
-	if err := s.accountRepo.Update(ctx, account); err != nil {
+	if err := s.accountRepo.ClearRateLimit(ctx, id); err != nil {
 		return nil, err
 	}
-	return account, nil
+	if err := s.accountRepo.ClearAntigravityQuotaScopes(ctx, id); err != nil {
+		return nil, err
+	}
+	if err := s.accountRepo.ClearModelRateLimits(ctx, id); err != nil {
+		return nil, err
+	}
+	if err := s.accountRepo.ClearTempUnschedulable(ctx, id); err != nil {
+		return nil, err
+	}
+	return s.accountRepo.GetByID(ctx, id)
 }
 
 func (s *adminServiceImpl) SetAccountError(ctx context.Context, id int64, errorMsg string) error {
@@ -2097,10 +2293,11 @@ func runProxyQualityTarget(ctx context.Context, client *http.Client, target prox
 		body = body[:proxyQualityMaxBodyBytes]
 	}
 
-	if target.Target == "sora" && soraerror.IsCloudflareChallengeResponse(resp.StatusCode, resp.Header, body) {
+	// Cloudflare challenge 检测
+	if httputil.IsCloudflareChallengeResponse(resp.StatusCode, resp.Header, body) {
 		item.Status = "challenge"
-		item.CFRay = soraerror.ExtractCloudflareRayID(resp.Header, body)
-		item.Message = "Sora 命中 Cloudflare challenge"
+		item.CFRay = httputil.ExtractCloudflareRayID(resp.Header, body)
+		item.Message = "命中 Cloudflare challenge"
 		return item
 	}
 
@@ -2438,4 +2635,152 @@ type MixedChannelError struct {
 func (e *MixedChannelError) Error() string {
 	return fmt.Sprintf("mixed_channel_warning: Group '%s' contains both %s and %s accounts. Using mixed channels in the same context may cause thinking block signature validation issues, which will fallback to non-thinking mode for historical messages.",
 		e.GroupName, e.CurrentPlatform, e.OtherPlatform)
+}
+
+func (s *adminServiceImpl) ResetAccountQuota(ctx context.Context, id int64) error {
+	return s.accountRepo.ResetQuotaUsed(ctx, id)
+}
+
+// EnsureOpenAIPrivacy 检查 OpenAI OAuth 账号是否已设置 privacy_mode，
+// 未设置则调用 disableOpenAITraining 并持久化到 Extra，返回设置的 mode 值。
+func (s *adminServiceImpl) EnsureOpenAIPrivacy(ctx context.Context, account *Account) string {
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return ""
+	}
+	if s.privacyClientFactory == nil {
+		return ""
+	}
+	if shouldSkipOpenAIPrivacyEnsure(account.Extra) {
+		return ""
+	}
+
+	token, _ := account.Credentials["access_token"].(string)
+	if token == "" {
+		return ""
+	}
+
+	var proxyURL string
+	if account.ProxyID != nil {
+		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
+			proxyURL = p.URL()
+		}
+	}
+
+	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)
+	if mode == "" {
+		return ""
+	}
+
+	_ = s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode})
+	return mode
+}
+
+// ForceOpenAIPrivacy 强制重新设置 OpenAI OAuth 账号隐私，无论当前状态。
+func (s *adminServiceImpl) ForceOpenAIPrivacy(ctx context.Context, account *Account) string {
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return ""
+	}
+	if s.privacyClientFactory == nil {
+		return ""
+	}
+
+	token, _ := account.Credentials["access_token"].(string)
+	if token == "" {
+		return ""
+	}
+
+	var proxyURL string
+	if account.ProxyID != nil {
+		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
+			proxyURL = p.URL()
+		}
+	}
+
+	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)
+	if mode == "" {
+		return ""
+	}
+
+	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
+		logger.LegacyPrintf("service.admin", "force_update_openai_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
+		return mode
+	}
+	if account.Extra == nil {
+		account.Extra = make(map[string]any)
+	}
+	account.Extra["privacy_mode"] = mode
+	return mode
+}
+
+// EnsureAntigravityPrivacy 检查 Antigravity OAuth 账号隐私状态。
+// 仅当 privacy_mode 已成功设置（"privacy_set"）时跳过；
+// 未设置或之前失败（"privacy_set_failed"）均会重试。
+func (s *adminServiceImpl) EnsureAntigravityPrivacy(ctx context.Context, account *Account) string {
+	if account.Platform != PlatformAntigravity || account.Type != AccountTypeOAuth {
+		return ""
+	}
+	if account.Extra != nil {
+		if existing, ok := account.Extra["privacy_mode"].(string); ok && existing == AntigravityPrivacySet {
+			return existing
+		}
+	}
+
+	token, _ := account.Credentials["access_token"].(string)
+	if token == "" {
+		return ""
+	}
+
+	projectID, _ := account.Credentials["project_id"].(string)
+
+	var proxyURL string
+	if account.ProxyID != nil {
+		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
+			proxyURL = p.URL()
+		}
+	}
+
+	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
+	if mode == "" {
+		return ""
+	}
+
+	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
+		logger.LegacyPrintf("service.admin", "update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
+		return mode
+	}
+	applyAntigravityPrivacyMode(account, mode)
+	return mode
+}
+
+// ForceAntigravityPrivacy 强制重新设置 Antigravity OAuth 账号隐私，无论当前状态。
+func (s *adminServiceImpl) ForceAntigravityPrivacy(ctx context.Context, account *Account) string {
+	if account.Platform != PlatformAntigravity || account.Type != AccountTypeOAuth {
+		return ""
+	}
+
+	token, _ := account.Credentials["access_token"].(string)
+	if token == "" {
+		return ""
+	}
+
+	projectID, _ := account.Credentials["project_id"].(string)
+
+	var proxyURL string
+	if account.ProxyID != nil {
+		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
+			proxyURL = p.URL()
+		}
+	}
+
+	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
+	if mode == "" {
+		return ""
+	}
+
+	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
+		logger.LegacyPrintf("service.admin", "force_update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
+		return mode
+	}
+	applyAntigravityPrivacyMode(account, mode)
+	return mode
 }

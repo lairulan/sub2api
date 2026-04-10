@@ -79,7 +79,7 @@ func (s *accountRepoStub) List(ctx context.Context, params pagination.Pagination
 	panic("unexpected List call")
 }
 
-func (s *accountRepoStub) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64) ([]Account, *pagination.PaginationResult, error) {
+func (s *accountRepoStub) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, *pagination.PaginationResult, error) {
 	panic("unexpected ListWithFilters call")
 }
 
@@ -197,6 +197,14 @@ func (s *accountRepoStub) UpdateExtra(ctx context.Context, id int64, updates map
 
 func (s *accountRepoStub) BulkUpdate(ctx context.Context, ids []int64, updates AccountBulkUpdate) (int64, error) {
 	panic("unexpected BulkUpdate call")
+}
+
+func (s *accountRepoStub) IncrementQuotaUsed(ctx context.Context, id int64, amount float64) error {
+	return nil
+}
+
+func (s *accountRepoStub) ResetQuotaUsed(ctx context.Context, id int64) error {
+	return nil
 }
 
 // TestAccountService_Delete_NotFound 测试删除不存在的账号时返回正确的错误。

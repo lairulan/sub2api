@@ -41,7 +41,7 @@
         </span>
       </div>
 
-      <div v-if="!isSoraAccount" class="space-y-1.5">
+      <div class="space-y-1.5">
         <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
           {{ t('admin.accounts.selectTestModel') }}
         </label>
@@ -54,11 +54,16 @@
           :placeholder="loadingModels ? t('common.loading') + '...' : t('admin.accounts.selectTestModel')"
         />
       </div>
-      <div
-        v-else
-        class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:border-blue-700 dark:bg-blue-900/20 dark:text-blue-300"
-      >
-        {{ t('admin.accounts.soraTestHint') }}
+
+      <div v-if="supportsGeminiImageTest" class="space-y-1.5">
+        <TextArea
+          v-model="testPrompt"
+          :label="t('admin.accounts.geminiImagePromptLabel')"
+          :placeholder="t('admin.accounts.geminiImagePromptPlaceholder')"
+          :hint="t('admin.accounts.geminiImageTestHint')"
+          :disabled="status === 'connecting'"
+          rows="3"
+        />
       </div>
 
       <!-- Terminal Output -->
@@ -115,17 +120,42 @@
         </button>
       </div>
 
+      <div v-if="generatedImages.length > 0" class="space-y-2">
+        <div class="text-xs font-medium text-gray-600 dark:text-gray-300">
+          {{ t('admin.accounts.geminiImagePreview') }}
+        </div>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <a
+            v-for="(image, index) in generatedImages"
+            :key="`${image.url}-${index}`"
+            :href="image.url"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm transition hover:border-primary-300 hover:shadow-md dark:border-dark-500 dark:bg-dark-700"
+          >
+            <img :src="image.url" :alt="`gemini-test-image-${index + 1}`" class="h-48 w-full object-cover" />
+            <div class="border-t border-gray-100 px-3 py-2 text-xs text-gray-500 dark:border-dark-500 dark:text-gray-300">
+              {{ image.mimeType || 'image/*' }}
+            </div>
+          </a>
+        </div>
+      </div>
+
       <!-- Test Info -->
       <div class="flex items-center justify-between px-1 text-xs text-gray-500 dark:text-gray-400">
         <div class="flex items-center gap-3">
           <span class="flex items-center gap-1">
             <Icon name="grid" size="sm" :stroke-width="2" />
-            {{ isSoraAccount ? t('admin.accounts.soraTestTarget') : t('admin.accounts.testModel') }}
+            {{ t('admin.accounts.testModel') }}
           </span>
         </div>
         <span class="flex items-center gap-1">
           <Icon name="chat" size="sm" :stroke-width="2" />
-          {{ isSoraAccount ? t('admin.accounts.soraTestMode') : t('admin.accounts.testPrompt') }}
+          {{
+            supportsGeminiImageTest
+              ? t('admin.accounts.geminiImageTestMode')
+              : t('admin.accounts.testPrompt')
+          }}
         </span>
       </div>
     </div>
@@ -141,10 +171,10 @@
         </button>
         <button
           @click="startTest"
-          :disabled="status === 'connecting' || (!isSoraAccount && !selectedModelId)"
+          :disabled="status === 'connecting' || !selectedModelId"
           :class="[
             'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all',
-            status === 'connecting' || (!isSoraAccount && !selectedModelId)
+            status === 'connecting' || !selectedModelId
               ? 'cursor-not-allowed bg-primary-400 text-white'
               : status === 'success'
                 ? 'bg-green-500 text-white hover:bg-green-600'
@@ -182,6 +212,7 @@ import { computed, ref, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import Select from '@/components/common/Select.vue'
+import TextArea from '@/components/common/TextArea.vue'
 import { Icon } from '@/components/icons'
 import { useClipboard } from '@/composables/useClipboard'
 import { adminAPI } from '@/api/admin'
@@ -193,6 +224,11 @@ const { copyToClipboard } = useClipboard()
 interface OutputLine {
   text: string
   class: string
+}
+
+interface PreviewImage {
+  url: string
+  mimeType?: string
 }
 
 const props = defineProps<{
@@ -211,15 +247,35 @@ const streamingContent = ref('')
 const errorMessage = ref('')
 const availableModels = ref<ClaudeModel[]>([])
 const selectedModelId = ref('')
+const testPrompt = ref('')
 const loadingModels = ref(false)
 let eventSource: EventSource | null = null
-const isSoraAccount = computed(() => props.account?.platform === 'sora')
+const generatedImages = ref<PreviewImage[]>([])
+const prioritizedGeminiModels = ['gemini-3.1-flash-image', 'gemini-2.5-flash-image', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-2.0-flash']
+const supportsGeminiImageTest = computed(() => {
+  const modelID = selectedModelId.value.toLowerCase()
+  if (!modelID.startsWith('gemini-') || !modelID.includes('-image')) return false
+
+  return props.account?.platform === 'gemini' || (props.account?.platform === 'antigravity' && props.account?.type === 'apikey')
+})
+
+const sortTestModels = (models: ClaudeModel[]) => {
+  const priorityMap = new Map(prioritizedGeminiModels.map((id, index) => [id, index]))
+
+  return [...models].sort((a, b) => {
+    const aPriority = priorityMap.get(a.id) ?? Number.MAX_SAFE_INTEGER
+    const bPriority = priorityMap.get(b.id) ?? Number.MAX_SAFE_INTEGER
+    if (aPriority !== bPriority) return aPriority - bPriority
+    return 0
+  })
+}
 
 // Load available models when modal opens
 watch(
   () => props.show,
   async (newVal) => {
     if (newVal && props.account) {
+      testPrompt.value = ''
       resetState()
       await loadAvailableModels()
     } else {
@@ -228,29 +284,26 @@ watch(
   }
 )
 
+watch(selectedModelId, () => {
+  if (supportsGeminiImageTest.value && !testPrompt.value.trim()) {
+    testPrompt.value = t('admin.accounts.geminiImagePromptDefault')
+  }
+})
+
 const loadAvailableModels = async () => {
   if (!props.account) return
-  if (props.account.platform === 'sora') {
-    availableModels.value = []
-    selectedModelId.value = ''
-    loadingModels.value = false
-    return
-  }
 
   loadingModels.value = true
   selectedModelId.value = '' // Reset selection before loading
   try {
-    availableModels.value = await adminAPI.accounts.getAvailableModels(props.account.id)
+    const models = await adminAPI.accounts.getAvailableModels(props.account.id)
+    availableModels.value = props.account.platform === 'gemini' || props.account.platform === 'antigravity'
+      ? sortTestModels(models)
+      : models
     // Default selection by platform
     if (availableModels.value.length > 0) {
       if (props.account.platform === 'gemini') {
-        const preferred =
-          availableModels.value.find((m) => m.id === 'gemini-2.0-flash') ||
-          availableModels.value.find((m) => m.id === 'gemini-2.5-flash') ||
-          availableModels.value.find((m) => m.id === 'gemini-2.5-pro') ||
-          availableModels.value.find((m) => m.id === 'gemini-3-flash-preview') ||
-          availableModels.value.find((m) => m.id === 'gemini-3-pro-preview')
-        selectedModelId.value = preferred?.id || availableModels.value[0].id
+        selectedModelId.value = availableModels.value[0].id
       } else {
         // Try to select Sonnet as default, otherwise use first model
         const sonnetModel = availableModels.value.find((m) => m.id.includes('sonnet'))
@@ -272,6 +325,7 @@ const resetState = () => {
   outputLines.value = []
   streamingContent.value = ''
   errorMessage.value = ''
+  generatedImages.value = []
 }
 
 const handleClose = () => {
@@ -303,7 +357,7 @@ const scrollToBottom = async () => {
 }
 
 const startTest = async () => {
-  if (!props.account || (!isSoraAccount.value && !selectedModelId.value)) return
+  if (!props.account || !selectedModelId.value) return
 
   resetState()
   status.value = 'connecting'
@@ -324,9 +378,10 @@ const startTest = async () => {
         Authorization: `Bearer ${localStorage.getItem('auth_token')}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(
-        isSoraAccount.value ? {} : { model_id: selectedModelId.value }
-      )
+      body: JSON.stringify({
+              model_id: selectedModelId.value,
+              prompt: supportsGeminiImageTest.value ? testPrompt.value.trim() : ''
+            })
     })
 
     if (!response.ok) {
@@ -376,6 +431,8 @@ const handleEvent = (event: {
   model?: string
   success?: boolean
   error?: string
+  image_url?: string
+  mime_type?: string
 }) => {
   switch (event.type) {
     case 'test_start':
@@ -384,7 +441,9 @@ const handleEvent = (event: {
         addLine(t('admin.accounts.usingModel', { model: event.model }), 'text-cyan-400')
       }
       addLine(
-        isSoraAccount.value ? t('admin.accounts.soraTestingFlow') : t('admin.accounts.sendingTestMessage'),
+        supportsGeminiImageTest.value
+            ? t('admin.accounts.sendingGeminiImageRequest')
+            : t('admin.accounts.sendingTestMessage'),
         'text-gray-400'
       )
       addLine('', 'text-gray-300')
@@ -395,6 +454,16 @@ const handleEvent = (event: {
       if (event.text) {
         streamingContent.value += event.text
         scrollToBottom()
+      }
+      break
+
+    case 'image':
+      if (event.image_url) {
+        generatedImages.value.push({
+          url: event.image_url,
+          mimeType: event.mime_type
+        })
+        addLine(t('admin.accounts.geminiImageReceived', { count: generatedImages.value.length }), 'text-purple-300')
       }
       break
 

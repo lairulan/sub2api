@@ -36,6 +36,7 @@ export async function list(
     status?: string
     group?: string
     search?: string
+    privacy_mode?: string
     lite?: string
   },
   options?: {
@@ -66,7 +67,9 @@ export async function listWithEtag(
     platform?: string
     type?: string
     status?: string
+    group?: string
     search?: string
+    privacy_mode?: string
     lite?: string
   },
   options?: {
@@ -223,8 +226,10 @@ export async function clearError(id: number): Promise<Account> {
  * @param id - Account ID
  * @returns Account usage info
  */
-export async function getUsage(id: number): Promise<AccountUsageInfo> {
-  const { data } = await apiClient.get<AccountUsageInfo>(`/admin/accounts/${id}/usage`)
+export async function getUsage(id: number, source?: 'passive' | 'active'): Promise<AccountUsageInfo> {
+  const { data } = await apiClient.get<AccountUsageInfo>(`/admin/accounts/${id}/usage`, {
+    params: source ? { source } : undefined
+  })
   return data
 }
 
@@ -236,6 +241,28 @@ export async function getUsage(id: number): Promise<AccountUsageInfo> {
 export async function clearRateLimit(id: number): Promise<Account> {
   const { data } = await apiClient.post<Account>(
     `/admin/accounts/${id}/clear-rate-limit`
+  )
+  return data
+}
+
+/**
+ * Recover account runtime state in one call
+ * @param id - Account ID
+ * @returns Updated account
+ */
+export async function recoverState(id: number): Promise<Account> {
+  const { data } = await apiClient.post<Account>(`/admin/accounts/${id}/recover-state`)
+  return data
+}
+
+/**
+ * Reset account quota usage
+ * @param id - Account ID
+ * @returns Updated account
+ */
+export async function resetAccountQuota(id: number): Promise<Account> {
+  const { data } = await apiClient.post<Account>(
+    `/admin/accounts/${id}/reset-quota`
   )
   return data
 }
@@ -525,37 +552,66 @@ export async function getAntigravityDefaultModelMapping(): Promise<Record<string
 export async function refreshOpenAIToken(
   refreshToken: string,
   proxyId?: number | null,
-  endpoint: string = '/admin/openai/refresh-token'
+  endpoint: string = '/admin/openai/refresh-token',
+  clientId?: string
 ): Promise<Record<string, unknown>> {
-  const payload: { refresh_token: string; proxy_id?: number } = {
+  const payload: { refresh_token: string; proxy_id?: number; client_id?: string } = {
     refresh_token: refreshToken
   }
   if (proxyId) {
     payload.proxy_id = proxyId
+  }
+  if (clientId) {
+    payload.client_id = clientId
   }
   const { data } = await apiClient.post<Record<string, unknown>>(endpoint, payload)
   return data
 }
 
 /**
- * Validate Sora session token and exchange to access token
- * @param sessionToken - Sora session token
- * @param proxyId - Optional proxy ID
- * @param endpoint - API endpoint path
- * @returns Token information including access_token
+ * Batch operation result type
  */
-export async function validateSoraSessionToken(
-  sessionToken: string,
-  proxyId?: number | null,
-  endpoint: string = '/admin/sora/st2at'
-): Promise<Record<string, unknown>> {
-  const payload: { session_token: string; proxy_id?: number } = {
-    session_token: sessionToken
-  }
-  if (proxyId) {
-    payload.proxy_id = proxyId
-  }
-  const { data } = await apiClient.post<Record<string, unknown>>(endpoint, payload)
+export interface BatchOperationResult {
+  total: number
+  success: number
+  failed: number
+  errors?: Array<{ account_id: number; error: string }>
+  warnings?: Array<{ account_id: number; warning: string }>
+}
+
+/**
+ * Batch clear account errors
+ * @param accountIds - Array of account IDs
+ * @returns Batch operation result
+ */
+export async function batchClearError(accountIds: number[]): Promise<BatchOperationResult> {
+  const { data } = await apiClient.post<BatchOperationResult>('/admin/accounts/batch-clear-error', {
+    account_ids: accountIds
+  })
+  return data
+}
+
+/**
+ * Batch refresh account credentials
+ * @param accountIds - Array of account IDs
+ * @returns Batch operation result
+ */
+export async function batchRefresh(accountIds: number[]): Promise<BatchOperationResult> {
+  const { data } = await apiClient.post<BatchOperationResult>('/admin/accounts/batch-refresh', {
+    account_ids: accountIds,
+  }, {
+    timeout: 120000  // 120s timeout for large batch refreshes
+  })
+  return data
+}
+
+/**
+ * Set privacy for an Antigravity OAuth account
+ * @param id - Account ID
+ * @returns Updated account
+ */
+export async function setPrivacy(id: number): Promise<Account> {
+  const { data } = await apiClient.post<Account>(`/admin/accounts/${id}/set-privacy`)
   return data
 }
 
@@ -576,6 +632,8 @@ export const accountsAPI = {
   getTodayStats,
   getBatchTodayStats,
   clearRateLimit,
+  recoverState,
+  resetAccountQuota,
   getTempUnschedulableStatus,
   resetTempUnschedulable,
   setSchedulable,
@@ -583,7 +641,6 @@ export const accountsAPI = {
   generateAuthUrl,
   exchangeCode,
   refreshOpenAIToken,
-  validateSoraSessionToken,
   batchCreate,
   batchUpdateCredentials,
   bulkUpdate,
@@ -591,7 +648,10 @@ export const accountsAPI = {
   syncFromCrs,
   exportData,
   importData,
-  getAntigravityDefaultModelMapping
+  getAntigravityDefaultModelMapping,
+  batchClearError,
+  batchRefresh,
+  setPrivacy
 }
 
 export default accountsAPI

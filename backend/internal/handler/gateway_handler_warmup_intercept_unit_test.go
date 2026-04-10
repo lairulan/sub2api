@@ -34,7 +34,12 @@ func (f *fakeSchedulerCache) GetSnapshot(_ context.Context, _ service.SchedulerB
 func (f *fakeSchedulerCache) SetSnapshot(_ context.Context, _ service.SchedulerBucket, _ []service.Account) error {
 	return nil
 }
-func (f *fakeSchedulerCache) GetAccount(_ context.Context, _ int64) (*service.Account, error) {
+func (f *fakeSchedulerCache) GetAccount(_ context.Context, id int64) (*service.Account, error) {
+	for _, account := range f.accounts {
+		if account != nil && account.ID == id {
+			return account, nil
+		}
+	}
 	return nil, nil
 }
 func (f *fakeSchedulerCache) SetAccount(_ context.Context, _ *service.Account) error { return nil }
@@ -75,8 +80,10 @@ func (f *fakeGroupRepo) ListActive(context.Context) ([]service.Group, error) { r
 func (f *fakeGroupRepo) ListActiveByPlatform(context.Context, string) ([]service.Group, error) {
 	return nil, nil
 }
-func (f *fakeGroupRepo) ExistsByName(context.Context, string) (bool, error)    { return false, nil }
-func (f *fakeGroupRepo) GetAccountCount(context.Context, int64) (int64, error) { return 0, nil }
+func (f *fakeGroupRepo) ExistsByName(context.Context, string) (bool, error) { return false, nil }
+func (f *fakeGroupRepo) GetAccountCount(context.Context, int64) (int64, int64, error) {
+	return 0, 0, nil
+}
 func (f *fakeGroupRepo) DeleteAccountGroupsByGroupID(context.Context, int64) (int64, error) {
 	return 0, nil
 }
@@ -127,6 +134,7 @@ func (f *fakeConcurrencyCache) GetAccountConcurrencyBatch(_ context.Context, acc
 	return result, nil
 }
 func (f *fakeConcurrencyCache) CleanupExpiredAccountSlots(context.Context, int64) error { return nil }
+func (f *fakeConcurrencyCache) CleanupStaleProcessSlots(context.Context, string) error  { return nil }
 
 func newTestGatewayHandler(t *testing.T, group *service.Group, accounts []*service.Account) (*GatewayHandler, func()) {
 	t.Helper()
@@ -138,6 +146,7 @@ func newTestGatewayHandler(t *testing.T, group *service.Group, accounts []*servi
 		nil, // accountRepo (not used: scheduler snapshot hit)
 		&fakeGroupRepo{group: group},
 		nil, // usageLogRepo
+		nil, // usageBillingRepo
 		nil, // userRepo
 		nil, // userSubRepo
 		nil, // userGroupRateRepo
@@ -155,6 +164,10 @@ func newTestGatewayHandler(t *testing.T, group *service.Group, accounts []*servi
 		nil, // sessionLimitCache
 		nil, // rpmCache
 		nil, // digestStore
+		nil, // settingService
+		nil, // tlsFPProfileService
+		nil, // channelService
+		nil, // resolver
 	)
 
 	// RunModeSimple：跳过计费检查，避免引入 repo/cache 依赖。

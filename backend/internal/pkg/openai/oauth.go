@@ -17,8 +17,6 @@ import (
 const (
 	// OAuth Client ID for OpenAI (Codex CLI official)
 	ClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-	// OAuth Client ID for Sora mobile flow (aligned with sora2api)
-	SoraClientID = "app_LlGpXReQgckcGGUo2JrYvtJK"
 
 	// OAuth endpoints
 	AuthorizeURL = "https://auth.openai.com/oauth/authorize"
@@ -39,8 +37,6 @@ const (
 const (
 	// OAuthPlatformOpenAI uses OpenAI Codex-compatible OAuth client.
 	OAuthPlatformOpenAI = "openai"
-	// OAuthPlatformSora uses Sora OAuth client.
-	OAuthPlatformSora = "sora"
 )
 
 // OAuthSession stores OAuth flow state for OpenAI
@@ -211,15 +207,8 @@ func BuildAuthorizationURLForPlatform(state, codeChallenge, redirectURI, platfor
 }
 
 // OAuthClientConfigByPlatform returns oauth client_id and whether codex simplified flow should be enabled.
-// Sora 授权流程复用 Codex CLI 的 client_id（支持 localhost redirect_uri），
-// 但不启用 codex_cli_simplified_flow；拿到的 access_token 绑定同一 OpenAI 账号，对 Sora API 同样可用。
 func OAuthClientConfigByPlatform(platform string) (clientID string, codexFlow bool) {
-	switch strings.ToLower(strings.TrimSpace(platform)) {
-	case OAuthPlatformSora:
-		return ClientID, false
-	default:
-		return ClientID, true
-	}
+	return ClientID, true
 }
 
 // TokenRequest represents the token exchange request body
@@ -268,7 +257,9 @@ type IDTokenClaims struct {
 type OpenAIAuthClaims struct {
 	ChatGPTAccountID string              `json:"chatgpt_account_id"`
 	ChatGPTUserID    string              `json:"chatgpt_user_id"`
+	ChatGPTPlanType  string              `json:"chatgpt_plan_type"`
 	UserID           string              `json:"user_id"`
+	POID             string              `json:"poid"` // organization ID in access_token JWT
 	Organizations    []OrganizationClaim `json:"organizations"`
 }
 
@@ -325,12 +316,9 @@ func (r *RefreshTokenRequest) ToFormData() string {
 	return params.Encode()
 }
 
-// ParseIDToken parses the ID Token JWT and extracts claims.
-// 注意：当前仅解码 payload 并校验 exp，未验证 JWT 签名。
-// 生产环境如需用 ID Token 做授权决策，应通过 OpenAI 的 JWKS 端点验证签名：
-//
-//	https://auth.openai.com/.well-known/jwks.json
-func ParseIDToken(idToken string) (*IDTokenClaims, error) {
+// DecodeIDToken decodes the ID Token JWT payload without validating expiration.
+// Use this for best-effort extraction (e.g., during data import) where the token may be expired.
+func DecodeIDToken(idToken string) (*IDTokenClaims, error) {
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid JWT format: expected 3 parts, got %d", len(parts))
@@ -360,6 +348,20 @@ func ParseIDToken(idToken string) (*IDTokenClaims, error) {
 		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
 	}
 
+	return &claims, nil
+}
+
+// ParseIDToken parses the ID Token JWT and extracts claims.
+// 注意：当前仅解码 payload 并校验 exp，未验证 JWT 签名。
+// 生产环境如需用 ID Token 做授权决策，应通过 OpenAI 的 JWKS 端点验证签名：
+//
+//	https://auth.openai.com/.well-known/jwks.json
+func ParseIDToken(idToken string) (*IDTokenClaims, error) {
+	claims, err := DecodeIDToken(idToken)
+	if err != nil {
+		return nil, err
+	}
+
 	// 校验 ID Token 是否已过期（允许 2 分钟时钟偏差，防止因服务器时钟略有差异误判刚颁发的令牌）
 	const clockSkewTolerance = 120 // 秒
 	now := time.Now().Unix()
@@ -367,7 +369,7 @@ func ParseIDToken(idToken string) (*IDTokenClaims, error) {
 		return nil, fmt.Errorf("id_token has expired (exp: %d, now: %d, skew_tolerance: %ds)", claims.Exp, now, clockSkewTolerance)
 	}
 
-	return &claims, nil
+	return claims, nil
 }
 
 // UserInfo represents user information extracted from ID Token claims.
@@ -375,6 +377,7 @@ type UserInfo struct {
 	Email            string
 	ChatGPTAccountID string
 	ChatGPTUserID    string
+	PlanType         string
 	UserID           string
 	OrganizationID   string
 	Organizations    []OrganizationClaim
@@ -389,6 +392,7 @@ func (c *IDTokenClaims) GetUserInfo() *UserInfo {
 	if c.OpenAIAuth != nil {
 		info.ChatGPTAccountID = c.OpenAIAuth.ChatGPTAccountID
 		info.ChatGPTUserID = c.OpenAIAuth.ChatGPTUserID
+		info.PlanType = c.OpenAIAuth.ChatGPTPlanType
 		info.UserID = c.OpenAIAuth.UserID
 		info.Organizations = c.OpenAIAuth.Organizations
 
